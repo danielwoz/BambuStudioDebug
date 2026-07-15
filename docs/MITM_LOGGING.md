@@ -1,229 +1,226 @@
 # MITM wire-logging (`obn-wire-flow/v1` capture)
 
-BambuStudioDebug is an instrumented fork of BambuStudio whose purpose is to
-record every network interaction the slicer performs, in the exact schema
-consumed by the wire-compliance harness (`obn-wire-flow/v1`). The captured
-traces become golden fixtures: the contract an OSS network library must
-reproduce message-for-message (method / path / query / header set+order /
-body shape).
+BambuStudioDebug is a BambuStudio fork whose job is to record what the
+**genuine, closed-source Bambu network plugin** puts on the wire, in the exact
+schema consumed by the open-bamboo-networking (OBN) wire-compliance harness
+(`obn-wire-flow/v1`). Those recordings are the **golden GENUINE traces**: the
+contract the OSS network library must reproduce message-for-message (method /
+path / query / header set + order / body shape).
 
-This document describes **where** the logging sits, **how** each intercepted
-interaction maps to a fixture, the **runtime capture directory** and the
-**anonymize-on-export** step, and how it plugs into the build. It is
-**Linux-first**; macOS and Windows are covered in *Cross-platform* at the end.
+The intended use: a user hits a problem with the OBN plugin, runs
+BambuStudioDebug (which uses the *genuine* plugin), reproduces the issue,
+exports a fixture with `import_flow.py`, drops it into the OBN harness, and the
+harness replays it against OSS and shows **exactly where OBN diverges from
+genuine**.
 
-Target build: release tag **`v02.07.00.55`** (this branch is based on it).
-That version reports `X-BBL-Client-Version: 02.07.00.55` on the wire, which is
-exactly the `slicer_client_version` of the existing fixtures under
-`obn-cloud-header-order/tests/wire-fixtures/linux/02.07.00.50/…`, so captures
-from this build drop straight into the current fixture tree. Master
-(`02.08.01.55`) is also buildable but would emit a different client-version
-header — a new fixture leaf, not a match for the current ones.
+This document describes the capture architecture, the log format, the
+import-to-fixture mapping, the runtime capture directory and anonymization, and
+the end-to-end verification. It is **Linux-first**; macOS/Windows notes are at
+the end.
 
 ---
 
 ## 1. Where the MITM sits — decision
 
-**The recorder lives inside the OSS `obn` network plugin, not in a separate TLS
-proxy and not in BambuStudio core.** Rationale:
+**The capture is a transport-level MITM of the genuine plugin's TLS traffic, not
+a tap inside any plugin.** The genuine plugin is closed source; we cannot add a
+recorder to it, and we specifically want *its* bytes, not the OSS plugin's. So
+we intercept at the socket/TLS layer, below the plugin:
 
-- BambuStudio does **no networking itself**. All cloud REST, LAN MQTT, FTPS,
-  SSDP and the libBambuSource CTRL/camera channels are delegated across a C ABI
-  (`bambu_network_*` / `Bambu_*`) to a dynamically-loaded plugin
-  (`src/slic3r/Utils/NetworkAgent.cpp` `dlopen`s
-  `libbambu_networking.so`). A tap in NetworkAgent would only see **ABI-level
-  arguments** (a `BBL::PrintParams`, a device id) — never the wire bytes,
-  header order, or exact paths the fixtures assert.
-- The `obn` plugin (`/mnt/cephfs/ssd/obn-cloud-header-order`) is a from-scratch
-  OSS implementation of that same ABI that **already intercepts every network
-  boundary** and already knows the genuine wire format (that is its whole
-  reason to exist). Every request is funnelled through a small number of choke
-  points. Adding a logging layer there gives us the true wire view for free.
-- A separate MITM TLS proxy (mitmproxy / a CA-injection box) would re-solve
-  TLS termination, certificate pinning on the LAN channel, and the proprietary
-  libBambuSource `:6000` tunnel — all of which `obn` already handles. It would
-  also miss the header *ordering* that Cloudflare fingerprints (a proxy
-  re-serialises headers).
+```
+BambuStudio (fork)  ->  genuine libbambu_networking.so  ->  libcurl/OpenSSL
+        |                                                        |
+        |  LD_PRELOAD tools/mitm-logging/mitm_redirect.so        |
+        |  - getaddrinfo: api.bambulab.com -> 127.0.0.2 sentinel |
+        |  - connect: sentinel:443 -> 127.0.0.1:$REDIRECT_443    |
+        |  - SSL_set_verify -> VERIFY_NONE (redirected leg only)  |
+        v                                                        v
+   mitmdump  --mode reverse:https://api.bambulab.com  (wire_addon.py)
+        |   terminates TLS with its own CA-minted api.bambulab.com cert,
+        |   logs the decrypted request/response, forwards to the real API
+        v
+   real api.bambulab.com
+```
 
-So: **BambuStudioDebug is configured to load the `obn` plugin, and `obn` gains
-a thin "wire recorder" that emits NDJSON at each choke point.** The recorder
-source is vendored in *this* repo (`tools/mitm-logging/recorder/`) so both
-sides can share one implementation; `obn` includes it at its choke points.
+Why transport-level and not an ABI tap or an OBN choke point:
 
-### Choke points in `obn` (one recorder call each)
+- BambuStudio does no networking itself; it delegates across a C ABI to the
+  plugin. A tap in `NetworkAgent` would only see ABI arguments, never the wire
+  bytes, header **order**, or exact paths the fixtures assert.
+- Recording inside the OBN plugin captures **OBN**, which is backwards — OBN is
+  the thing under test. We need the genuine reference.
+- A transport MITM sees the true genuine wire, including header ordering
+  (Cloudflare/JA4H fingerprint the header **set and order**).
 
-| Boundary | `obn` source / function | Recorder call |
-|----------|-------------------------|---------------|
-| Cloud REST (all api.bambulab.com + S3 PUTs) | `src/http_client.cpp` `obn::http::perform()` | `record_http()` — after headers are assembled in wire order, before/after `curl_easy_perform` |
-| LAN MQTT (device control, publishes + messages) | `src/mqtt_client.cpp` `Client::publish()` / `s_on_message` | `record_mqtt(dir, topic, payload, qos, retain)` |
-| FTPS upload / listing | `src/ftps.cpp` `Client::store()` (STOR) / `Client::list_entries()` (LIST) | `record_ftps(op, path, size, md5)` |
-| SSDP discovery | `src/ssdp.cpp` `parse()` / `Discovery` | `record_ssdp(dir, raw)` |
-| libBambuSource CTRL channel | `src/tunnel_local.cpp` cmdtype envelopes | `record_ctrl(dir, cmdtype, json)` |
+### Hostname scoping (why login still works)
 
-`http_client.cpp` already has an `OBN_HTTP_TRACE=1` verbose mode and a
-structured `OBN_DEBUG("http …")` line; the recorder is the structured,
-machine-readable sibling of that, gated by its own env so it stays off by
-default.
+`api.bambulab.com` shares Cloudflare front-ends with `bambulab.com` and
+`makerworld.com` (the sign-in webview). If we redirected by IP we would also
+break the webview's TLS. Instead the shim rewrites **only the
+`api.bambulab.com` hostname** at `getaddrinfo` time to a loopback sentinel
+(`127.0.0.2`); `connect()` then steers that sentinel's `:443` to the local
+mitmdump. Every other host resolves and connects normally with a real
+certificate, so the GnuTLS login webview is untouched. IPv6 for the API is
+black-holed to `::1` so the client falls back to the v4 sentinel rather than
+reaching the real API over v6 and bypassing capture.
 
-### Optional secondary tap (in this repo, `BBL_MITM_LOGGING`)
+### Trust on the redirected leg
 
-For completeness the fork also carries a build option `BBL_MITM_LOGGING`
-(default `OFF`) that compiles the recorder into the slicer itself for an
-**ABI-level** trace (what Studio hands the plugin, before wire encoding). This
-is a diagnostic cross-check, **not** the fixture source — the wire fixtures
-come from the `obn` choke points above.
+The genuine plugin uses libcurl/OpenSSL with its own CA bundle and would reject
+mitmproxy's interception certificate. The shim overrides `SSL_CTX_set_verify` /
+`SSL_set_verify` to `VERIFY_NONE` **on the plugin's OpenSSL leg only**. This is
+scoped to the redirected API connection; the webview (GnuTLS, real server) is
+unaffected. An equivalent alternative is to append the mitmproxy CA
+(`~/.mitmproxy/mitmproxy-ca-cert.pem`) to the plugin's CA bundle; disabling
+verification on the redirected leg is simpler and equally contained.
 
 ---
 
-## 2. Interaction → fixture mapping
+## 2. Components (`tools/mitm-logging/`)
 
-The recorder emits a flat **NDJSON event stream** (one JSON object per line)
-into the runtime capture dir. A post-processing step
-(`tools/mitm-logging/export_fixtures.py`) folds a session's events into one
-`flow.json` per `obn-wire-flow/v1` leaf and anonymises them.
+| File | Role |
+|------|------|
+| `mitm_redirect.c`, `build_redirect.sh` | LD_PRELOAD transport shim (above). |
+| `wire_addon.py` | mitmdump addon; appends one NDJSON line per request. |
+| `capture.sh` | orchestrator: build shim, start mitmdump, launch the slicer. |
+| `import_flow.py` | log -> anonymized `obn-wire-flow/v1` `flow.json`. |
 
-Fixture leaf path (from `FORMAT.md`):
+### Log format (one NDJSON line per request)
 
+```json
+{"method":"POST","path":"/v1/user-service/user/ticket/AJR7H7",
+ "query":"/v1/user-service/user/ticket/AJR7H7",
+ "headers":[["Host","api.bambulab.com"],["User-Agent","bambu_network_agent/02.07.00.50"], ...],
+ "blen":19,"body":"{\"ticket\":\"AJR7H7\"}","status":200}
 ```
-<os>/<network_plugin_version>/<channel>/<printer_model>/<flow>/flow.json
-```
 
-- `os` — `linux` for this build.
-- `network_plugin_version` — the `bambu_network_agent/<ver>` the `obn` build
-  reports (its `OBN_VERSION`, e.g. `02.07.00.50`).
-- `channel` — `cloud` | `cloud_lan` | `lan`, inferred from the recorded event
-  set (presence of the `ftp://`-placeholder PATCH + FTPS STOR ⇒ `cloud_lan`;
-  pure S3 download, no LAN legs ⇒ `cloud`; no api.bambulab.com at all ⇒ `lan`).
-- `printer_model` — `account` for user/preset/filament flows; `h2s`/`h2d`/`a1`
-  for device flows (from the driver / dev serial prefix).
-- `flow` — the UI action the session was driven for (operator picks it when
-  launching a capture; see the run script's `BBL_MITM_FLOW`).
-
-### Per-event → `steps[]` mapping
-
-| Recorder event | `obn-wire-flow/v1` element |
-|----------------|---------------------------|
-| `http` | one `steps[]` entry: `protocol:"http"`, `request.method/host/path`, `request.query`, `request.headers` (the recorded ordered header list is diffed against the flow's `identity_block.order` to set the `block`/`client_id`/`content_type`/`authorization` flags + `extra`), `request.body_json`/`body_raw`, `expect.status` |
-| `mqtt` (publish to `device/<serial>/request`) | `steps[]` with `protocol:"mqtt"`, `channel_only` where relevant; body is the command envelope (for signed `print` commands the `sign_string` is captured for the harness to *verify*, never the key) |
-| `ftps` STOR | the `cloud_lan`-only upload leg; `ftp_file_md5` in the fixture `driver` block |
-| `ftps` LIST | `storage_list` flow: raw listing bytes → `driver.listing` + `expect_files` |
-| `ssdp` | `ssdp_discovery` flow: raw NOTIFY → parsed device-info JSON |
-| `ctrl` | `ctrl_storage_list` flow: cmdtype envelope sequence |
-
-The first line of every session is a `meta` event carrying
-`os / network_plugin_version / slicer_client_version / channel / printer_model
-/ flow`, which becomes the fixture `meta{}` block. `identity_block` and `vars`
-are filled by the exporter from the observed headers and the values it must
-treat as dynamic (tokens, uuids, timestamps, presigned URLs).
-
-The exporter emits a **skeleton** `flow.json` that a human reviews against the
-existing hand-authored fixtures before it is committed — it is a capture aid,
-not an auto-committer.
+- `headers` preserves on-wire order (the harness asserts order).
+- The addon masks the `Authorization` bearer token in the log; everything else
+  is anonymized at import. Raw logs still land in a gitignored dir.
+- Response bodies are not recorded (the request-matching harness does not need
+  them; the fixture's `captures` are documented JSON-paths, not live values).
 
 ---
 
-## 3. Runtime capture dir + anonymize-on-export
+## 3. Capture -> fixture mapping (`import_flow.py`)
 
-- Raw captures are written to **`$BBL_MITM_CAPTURE_DIR`** (default
-  `./mitm-captures/` at the repo root). This directory is **gitignored**
-  (`.gitignore` → `mitm-captures/`). Raw captures contain live tokens, real
-  uid/email/serials/IPs/access codes and MUST NOT be committed.
-- Filenames: `session-<UTC-timestamp>-<flow>.ndjson`.
-- **Nothing** in the capture dir is safe to commit as-is.
-- `export_fixtures.py` performs the **anonymize-on-export** step required before
-  any fixture derived from a capture is committed:
+`import_flow.py LOG.jsonl --flow <flow> [--model M] [--channel C] [--os O] -o OUT`
 
-  | Field | Anonymized to |
-  |-------|---------------|
-  | IP addresses | `192.168.1.2` |
-  | access codes | `1234abcd` |
-  | serials | model prefix kept, rest zeroed (e.g. `094…` → `09400000000000`) |
-  | uid | `1234567890` |
-  | email | `bob@test.com` |
-  | bearer / access / refresh tokens | replaced with `<dynamic:…>` markers (they are `vars`, matched by kind not literal) |
-  | presigned S3 URLs | `host:"<presigned>"`, query dropped |
+| Fixture piece | Source |
+|---------------|--------|
+| `meta.os` | `X-BBL-OS-Type` (or `--os`) |
+| `meta.network_plugin_version` | `bambu_network_agent/<ver>` in User-Agent |
+| `meta.slicer_client_version` | `X-BBL-Client-Version` |
+| `meta.channel` / `meta.printer_model` / `meta.flow` | `--channel` / `--model` / `--flow` (recognizer may default) |
+| `identity_block.order` + `values` | header order of the most complete request in the flow; `X-BBL-Device-ID` -> `<dynamic:install-uuid>`, `Authorization` -> `<dynamic:Bearer access_token>` |
+| `steps[].request.headers` flags | presence of the identity block, a client-id header, `Content-Type`, `Authorization`; non-identity headers -> `extra` |
+| `steps[].request.body_json` | request body parsed as JSON (or `body_raw`), with `{{var}}` placeholders for recognized flows |
+| `steps[].captures` | JSON-paths the flow feeds forward (e.g. `$.accessToken`) |
 
-  Tokens, device-ids, timestamps and presigned URLs are turned into
-  `obn-wire-flow/v1` `vars` with `kind: session|generated|from_response`, so the
-  harness matches them by kind, never by the captured secret value.
+**Flow recognizers.** `login` has a precise recognizer that matches the harness
+driver exactly (POST `/v1/user-service/user/ticket/{{login_ticket}}` then GET
+`/v1/user-service/my/profile`, with the right var placeholders and captures).
+Other flows use a generic best-effort mode (`--match <path-substring>`) that
+turns each matching request into a step and templatizes long numeric path
+segments (task/design ids) into vars — a starting point to refine by hand
+against `FORMAT.md`.
 
-**Never committed, ever:** the extracted slicer signing key `d` /
-`slicer_key.pem`, any baked key value, `BambuNetworkEngine.conf`, cloud auth
-tokens, or raw captures with personal identifiers.
+### Anonymization (applied to every emitted value)
 
----
+| Real | Emitted |
+|------|---------|
+| IP address | `192.168.1.2` |
+| LAN access code (8 hex) | `1234abcd` |
+| printer serial | model-family prefix kept, remainder zeroed |
+| cloud uid (`uid`/`uidStr`/`user_id`) | `1234567890` |
+| email | `bob@test.com` |
+| bearer token | `<dynamic:Bearer access_token>` |
+| install/device UUID | `<dynamic:install-uuid>` |
 
-## 4. Build integration
-
-### 4.1 The plugin (primary — where the wire is seen)
-
-BambuStudioDebug loads the `obn` plugin instead of the proprietary one. Build
-`obn` with the recorder enabled and run the slicer pointed at it:
-
-```
-# build obn with wire recording compiled in (adds tools/mitm-logging/recorder)
-cd /mnt/cephfs/ssd/obn-cloud-header-order
-./configure --with-version=02.07.00.50 --enable-wire-record   # (obn-side flag, see run script)
-make && make install     # installs libbambu_networking_02.07.00.50.so into the slicer plugin dir
-
-# then launch the slicer with capture on
-tools/mitm-logging/run_with_logging.sh --flow start_print --model h2s
-```
-
-`run_with_logging.sh` sets `BBL_MITM_CAPTURE_DIR`, `BBL_MITM_FLOW`,
-`OBN_WIRE_RECORD=1` (the env the `obn` recorder honours) and launches the
-built `bambu-studio` binary. The obn-side `--enable-wire-record` /
-`OBN_WIRE_RECORD` wiring is the remaining obn change (Phase 2 below); the
-recorder library itself already lives here and compiles standalone.
-
-### 4.2 The slicer (secondary — ABI-level cross-check)
-
-Top-level CMake option, default OFF:
-
-```
-cmake -S . -B build -DBBL_MITM_LOGGING=ON …
-```
-
-When ON it defines `BBL_MITM_LOGGING` and adds
-`tools/mitm-logging/recorder` to the include path so a NetworkAgent-level tap
-can call the same recorder. This is intentionally minimal for milestone 1 —
-the tap call-sites in `NetworkAgent.cpp` are Phase 2.
+Version strings (`02.07.00.50`) are preserved — the IP rule only matches real
+dotted-quads (octets 0-255, no leading zeros), so it never mangles a version.
 
 ---
 
-## 5. Cross-platform
+## 4. End-to-end workflow
 
-- **Linux** — implemented target of this milestone (recorder + build option +
-  run/export tooling). The `X-BBL-OS-*` identity block is the `linux` variant.
-- **macOS — deferred.** Same plugin-load model (`.dylib`), different
-  `X-BBL-OS-Type: macos` identity and different config paths; it produces a new
-  `macos/…` fixture tree. Not scaffolded here.
-- **Windows — deferred, and additionally depends on the BambuSlicerKeySaver
-  watchdogs** (`/mnt/cephfs/ssd/slicer_key_saver/BambuSlicerKeySaver`). On
-  Windows the proprietary stack is packed (VMProtect) and the plugin/source
-  libraries need the keysaver watchdogs to reach a running, interceptable
-  state:
-  - the **conf-key / slicer-key saver** watchdog (recovers the
-    `bambu_networking` conf + slicer key so an `obn`-style plugin can be
-    substituted at all), and
-  - the **process/inject watchdog** that keeps the substituted plugin loaded
-    past the module signature check.
+```
+# 1. capture with the genuine plugin (one manual step: log in + drive the UI)
+tools/mitm-logging/capture.sh --studio ./build/src/bambu-studio
+#    -> mitm-captures/http_all.jsonl   (gitignored)
 
-  Until those are wired into a Windows BambuStudioDebug build, Windows capture
-  is out of scope. The `X-BBL-OS-Type: windows` identity + `windows/…` fixture
-  tree is the eventual deliverable.
+# 2. import a flow -> anonymized fixture
+python3 tools/mitm-logging/import_flow.py mitm-captures/http_all.jsonl \
+    --flow login --model account --channel cloud -o /tmp/flow.json
+
+# 3. place it in the OBN fixture tree and run the harness
+cp /tmp/flow.json \
+  <obn>/tests/wire-fixtures/linux/02.07.00.50/cloud/account/login/flow.json
+ctest --test-dir <obn>/build -R wire_ --output-on-failure
+#    or directly:
+<obn>/build/wire_compliance_test /tmp/flow.json
+```
+
+### Reading a failure as "OBN diverges from genuine"
+
+The harness drives the OSS plugin for `meta.flow`, records every request OSS
+emits, and asserts it against `steps[]`. A pass means OSS matches the genuine
+trace. A failure names the first divergence, e.g.:
+
+```
+FAIL: [exchange_ticket] header X-BBL-Language out of JA4H order
+FAIL: [get_profile] missing Content-Type
+```
+
+Each line is a concrete field where the OSS plugin's wire output differs from
+the genuine trace you captured — the exact thing to fix in OBN.
 
 ---
 
-## 6. Status (milestone 1)
+## 5. Verification status
 
-- Fork + all upstream tags: **done**.
-- Recorder library (`tools/mitm-logging/recorder/`): **compiles standalone**
-  (see its CMake + smoke target).
-- `BBL_MITM_LOGGING` build option + `.gitignore` capture dir: **done**.
-- Run + export/anonymize scripts: **scaffolded** (export emits a review
-  skeleton; not yet exercised against a live capture).
-- `obn`-side choke-point calls + `OBN_WIRE_RECORD` wiring: **Phase 2, not done**.
-- NetworkAgent ABI-level tap call-sites: **Phase 2, not done**.
-- macOS / Windows: **deferred** (Windows blocked on keysaver watchdogs).
-</invoke>
+Verified end-to-end on Linux against a genuine capture
+(`bambu_network_agent/02.07.00.50`, slicer `02.07.00.55`):
+
+- `import_flow.py --flow login` on a real genuine log produces a fixture whose
+  structure matches the hand-authored login fixture.
+- `wire_compliance_test <fixture>` **passes** (OSS matches genuine for login).
+- Perturbing the fixture (e.g. swapping two identity headers) makes the harness
+  report the concrete divergence — proving the match/diff path both ways.
+
+**Working:** HTTPS (`api.bambulab.com`) capture, login import, harness
+integration, anonymization.
+
+**Manual step:** the live capture itself needs the user's Bambu login and GUI
+interaction — it cannot be automated.
+
+**Extensions (schema ready, transport not yet wired):**
+
+- **MQTT (8883)** — LAN device control. The redirect shim only scopes `:443`;
+  add an `:8883` sentinel + an MQTT-aware proxy (e.g. mitmproxy's raw TCP mode
+  or a small broker relay) and emit `protocol:"mqtt"` steps. The fixture schema
+  already carries MQTT steps.
+- **FTPS (990)** — implicit-FTPS 3mf upload. Needs an FTPS-aware relay to log
+  `STOR`/`LIST`; the harness already models this with `FtpsMock`.
+- **S3 presigned PUTs** — the 3mf upload bodies go to short-lived S3 URLs on a
+  different host; scope the shim to those hosts or record them as
+  `host:"<presigned>"` steps.
+
+---
+
+## 6. Cross-platform
+
+- **macOS** — same design; `DYLD_INSERT_LIBRARIES` + an interpose table replaces
+  `LD_PRELOAD`, or use `mitmproxy` transparent mode with `pf`. The addon and
+  `import_flow.py` are unchanged.
+- **Windows** — the plugin is a DLL using WinHTTP/schannel or bundled OpenSSL;
+  redirect via a hosts entry / WinDivert to a local mitmdump and add the CA to
+  the trust the plugin uses. The log format and importer are unchanged.
+
+## Security
+
+Raw captures under `mitm-captures/` and the mitmproxy CA private key
+(`~/.mitmproxy/`) contain live tokens and personal identifiers. Both are
+gitignored / outside the repo and **must never be committed**. Only anonymized
+fixtures produced by `import_flow.py` are committed. Never commit the slicer
+signing key or any baked key value.

@@ -45,5 +45,5 @@ compile_commands.json
 /mitm-captures/
 mitm-captures/
 fixture-skeletons/
-tools/mitm-logging/recorder/build/
+tools/mitm-logging/mitm_redirect.so
 __pycache__/

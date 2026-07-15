@@ -50,17 +50,9 @@ set(IS_CROSS_COMPILE FALSE)
 
 set(FLATPAK FALSE CACHE BOOL "Not copy FFMPEG file")
 
-# BambuStudioDebug: MITM wire-logging. Default OFF so ordinary builds are
-# unaffected. When ON, the shared wire recorder (tools/mitm-logging/recorder)
-# is available on the include path and BBL_MITM_LOGGING is defined for an
-# optional ABI-level tap in NetworkAgent. The primary interception layer is the
-# OSS obn plugin; see docs/MITM_LOGGING.md.
-option(BBL_MITM_LOGGING "Compile the MITM wire-logging recorder into the slicer (ABI-level tap)" OFF)
-if (BBL_MITM_LOGGING)
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/tools/mitm-logging/recorder EXCLUDE_FROM_ALL)
-    add_compile_definitions(BBL_MITM_LOGGING)
-    message(STATUS "BBL_MITM_LOGGING enabled: wire recorder available (ABI-level tap)")
-endif ()
+# BambuStudioDebug: MITM wire-logging is a runtime-only tool (tools/mitm-logging).
+# It intercepts the GENUINE closed-source network plugin's TLS traffic with an
+# external proxy and needs no changes to the slicer build. See docs/MITM_LOGGING.md.
 
 
 if (APPLE)
