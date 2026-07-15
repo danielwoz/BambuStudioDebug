@@ -39,3 +39,11 @@ compile_commands.json
 .worktrees/
 **/dist/
 
+
+# BambuStudioDebug MITM wire-logging: runtime captures contain live tokens and
+# personal identifiers -- never commit. Only anonymized fixtures are committed.
+/mitm-captures/
+mitm-captures/
+fixture-skeletons/
+tools/mitm-logging/recorder/build/
+__pycache__/
