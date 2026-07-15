@@ -46,4 +46,6 @@ compile_commands.json
 mitm-captures/
 fixture-skeletons/
 tools/mitm-logging/mitm_redirect.so
+tools/mitm-logging/relay_cert.pem
+tools/mitm-logging/relay_key.pem
 __pycache__/

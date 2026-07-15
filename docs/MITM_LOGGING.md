@@ -78,12 +78,35 @@ verification on the redirected leg is simpler and equally contained.
 
 ## 2. Components (`tools/mitm-logging/`)
 
-| File | Role |
-|------|------|
-| `mitm_redirect.c`, `build_redirect.sh` | LD_PRELOAD transport shim (above). |
-| `wire_addon.py` | mitmdump addon; appends one NDJSON line per request. |
-| `capture.sh` | orchestrator: build shim, start mitmdump, launch the slicer. |
-| `import_flow.py` | log -> anonymized `obn-wire-flow/v1` `flow.json`. |
+| File | Role | Protocol |
+|------|------|----------|
+| `mitm_redirect.c`, `build_redirect.sh` | LD_PRELOAD transport shim; steers `:443` (api.bambulab.com) and, when the paired `REDIRECT_8883/990/6000` env is set, the LAN transports to local relays. | all |
+| `wire_addon.py` | mitmdump addon; one NDJSON line per REST request. | HTTPS |
+| `ssdp_sniff.py` | passive UDP `:2021` sniffer for printer NOTIFY broadcasts (no TLS). | SSDP |
+| `mqtt_relay.py` | TLS-terminating MQTT 3.1.1 relay for `:8883` (LAN printer / cloud broker). | MQTT |
+| `ftps_relay.py` | implicit-FTPS relay for `:990` (control + PASV data, TLS session reuse). | FTPS |
+| `ctrl_relay.py` | native CTRL tunnel relay for `:6000` (16-byte framed handshake). | CTRL |
+| `capture.sh` | HTTPS orchestrator: build shim, start mitmdump, launch the slicer. | HTTPS |
+| `import_flow.py` | any capture log -> anonymized `obn-wire-flow/v1` `flow.json`. | all |
+
+### Complete protocol coverage -> harness flows
+
+Every OBN wire-flow type is now generatable from a genuine capture:
+
+| Protocol | Transport | Capture tool | `import_flow.py --flow` | Harness driver |
+|----------|-----------|--------------|--------------------------|----------------|
+| HTTPS | `:443` TLS | `capture.sh` (shim + mitmdump) | `login` (+ generic `--match`) | HTTP mock |
+| SSDP | `:2021` UDP | `ssdp_sniff.py` | `ssdp_discovery` | `obn::ssdp` parse + live listener |
+| MQTT | `:8883` TLS | `mqtt_relay.py` | `device_command` | `MqttBrokerMock` |
+| FTPS | `:990` TLS | `ftps_relay.py` | `storage_list` | `FtpsMock` |
+| CTRL | `:6000` TLS | `ctrl_relay.py` (+ `ftps_relay.py`) | `ctrl_storage_list` | `NativeTunnelMock` + `FtpsMock` |
+
+The non-HTTP flows emit a `driver` block (not recorded HTTP steps): the harness
+feeds the captured raw material (SSDP packet, MQTT command_json, FTPS `listing`)
+to the OSS code and asserts the parsed/emitted result. `start_print`'s FTPS
+`STOR` leg (md5 of the uploaded 3mf) and its MQTT `project_file` leg reuse the
+same relays; that flow also needs the sliced 3mf asset and is driven by the
+harness's `body_builder`/`ftp_file_md5` path.
 
 ### Log format (one NDJSON line per request)
 
@@ -117,13 +140,25 @@ verification on the redirected leg is simpler and equally contained.
 | `steps[].request.body_json` | request body parsed as JSON (or `body_raw`), with `{{var}}` placeholders for recognized flows |
 | `steps[].captures` | JSON-paths the flow feeds forward (e.g. `$.accessToken`) |
 
-**Flow recognizers.** `login` has a precise recognizer that matches the harness
-driver exactly (POST `/v1/user-service/user/ticket/{{login_ticket}}` then GET
-`/v1/user-service/my/profile`, with the right var placeholders and captures).
-Other flows use a generic best-effort mode (`--match <path-substring>`) that
-turns each matching request into a step and templatizes long numeric path
-segments (task/design ids) into vars — a starting point to refine by hand
-against `FORMAT.md`.
+**Flow recognizers.** Each flow has a precise recognizer routed by `--flow`:
+
+- `login` (HTTP) — POST `/v1/user-service/user/ticket/{{login_ticket}}` then GET
+  `/v1/user-service/my/profile`, with var placeholders + captures.
+- `ssdp_discovery` (SSDP) — picks a NOTIFY (by `--src` or `--model`), anonymizes
+  the raw packet (Location IP, USN serial) while preserving header set/order/case
+  (incl. the A1 uppercase-`HOST`/`:1900`/`DevSignal`/no-`NTS` variant), and emits
+  the `driver.packet` + the `driver.expect` device-info the OSS parser must yield.
+- `device_command` (MQTT) — from a publish to `device/<serial>/request`; a
+  `system`/`pushing` command imports `signed:false` (verbatim), a `print`
+  envelope imports `signed:true` with `command_json={"print":…}` (the harness
+  re-signs RSA-SHA256 and cryptographically verifies).
+- `storage_list` (FTPS) — from a captured `LIST`; emits `driver.listing` (raw)
+  + `driver.expect_files` (all regular files, name+size).
+- `ctrl_storage_list` (CTRL) — same `listing` served over the FTPS bridge;
+  `expect_files` filtered to `.3mf` model files (the `type=model` listing).
+
+Any HTTP flow without a named recognizer uses a generic best-effort mode
+(`--match <path-substring>`) that templatizes long numeric path segments.
 
 ### Anonymization (applied to every emitted value)
 
@@ -144,22 +179,41 @@ dotted-quads (octets 0-255, no leading zeros), so it never mangles a version.
 
 ## 4. End-to-end workflow
 
-```
-# 1. capture with the genuine plugin (one manual step: log in + drive the UI)
-tools/mitm-logging/capture.sh --studio ./build/src/bambu-studio
-#    -> mitm-captures/http_all.jsonl   (gitignored)
+### HTTPS (cloud REST)
 
-# 2. import a flow -> anonymized fixture
+```
+tools/mitm-logging/capture.sh --studio ./build/src/bambu-studio   # log in, drive UI, quit
 python3 tools/mitm-logging/import_flow.py mitm-captures/http_all.jsonl \
     --flow login --model account --channel cloud -o /tmp/flow.json
-
-# 3. place it in the OBN fixture tree and run the harness
-cp /tmp/flow.json \
-  <obn>/tests/wire-fixtures/linux/02.07.00.50/cloud/account/login/flow.json
-ctest --test-dir <obn>/build -R wire_ --output-on-failure
-#    or directly:
 <obn>/build/wire_compliance_test /tmp/flow.json
 ```
+
+### SSDP (fully passive; no printer credentials, no proxy)
+
+```
+python3 tools/mitm-logging/ssdp_sniff.py --seconds 20 --out ssdp.jsonl   # sniff real NOTIFYs
+python3 tools/mitm-logging/import_flow.py ssdp.jsonl --flow ssdp_discovery --model a1 -o /tmp/ssdp.json
+<obn>/build/wire_compliance_test /tmp/ssdp.json
+```
+
+### MQTT / FTPS / CTRL (LAN; access code only, no Bambu account)
+
+Start the relay for the target printer, point the plugin's traffic at it via the
+shim (`REDIRECT_8883/990/6000=<relay port>`, one printer at a time), drive the
+flow, then import. Example for FTPS storage listing:
+
+```
+python3 tools/mitm-logging/ftps_relay.py --printer <ip> --dev <serial> \
+    --listen-port 9990 --out ftps.jsonl &
+LD_PRELOAD=tools/mitm-logging/mitm_redirect.so REDIRECT_990=9990 ./build/src/bambu-studio  # open Device->Storage
+python3 tools/mitm-logging/import_flow.py ftps.jsonl --flow storage_list --model <model> -o /tmp/sl.json
+<obn>/build/wire_compliance_test /tmp/sl.json
+```
+
+MQTT (`mqtt_relay.py --broker <ip> --listen-port 8883`, `--flow device_command`)
+and CTRL (`ctrl_relay.py --printer <ip> --listen-port 6000`, then
+`--flow ctrl_storage_list` reusing the FTPS listing) follow the same pattern.
+Point-and-import against the OBN tree + `ctest` as with HTTPS.
 
 ### Reading a failure as "OBN diverges from genuine"
 
@@ -179,32 +233,46 @@ the genuine trace you captured — the exact thing to fix in OBN.
 
 ## 5. Verification status
 
-Verified end-to-end on Linux against a genuine capture
-(`bambu_network_agent/02.07.00.50`, slicer `02.07.00.55`):
+All five protocols verified on Linux; each generated fixture is accepted by
+`wire_compliance_test` (`WIRE-COMPLIANCE OK`):
 
-- `import_flow.py --flow login` on a real genuine log produces a fixture whose
-  structure matches the hand-authored login fixture.
-- `wire_compliance_test <fixture>` **passes** (OSS matches genuine for login).
-- Perturbing the fixture (e.g. swapping two identity headers) makes the harness
-  report the concrete divergence — proving the match/diff path both ways.
+| Protocol / flow | Verified against | Result |
+|-----------------|------------------|--------|
+| HTTPS `login` | genuine capture (`http_all.jsonl`) | fixture passes; perturbation reports the concrete diff |
+| SSDP `ssdp_discovery` (a1 + h2s) | **live** real printer NOTIFY broadcasts on `:2021` | parse + live UDP listener pass |
+| MQTT `device_command` | **live** relay to a real printer `:8883` (CONNACK + PUBACK from the printer) | `MqttBrokerMock` matches |
+| FTPS `storage_list` | **live** relay to a real printer `:990` (real directory LIST, TLS session reuse) | `FtpsMock` parses all files |
+| CTRL `ctrl_storage_list` | **live** `:6000` LOGIN handshake against a real printer + full harness `NativeTunnelMock`+`FtpsMock` run | handshake accepted; harness passes |
 
-**Working:** HTTPS (`api.bambulab.com`) capture, login import, harness
-integration, anonymization.
+**What "live" means per protocol:**
 
-**Manual step:** the live capture itself needs the user's Bambu login and GUI
-interaction — it cannot be automated.
+- **SSDP** — fully live and automated: real printers broadcast every ~5s, no
+  credentials, no proxy. Captured, imported, and passed with no manual step.
+- **MQTT / FTPS / CTRL** — the relay logic (TLS-terminate, protocol parse, log,
+  forward) was smoke-tested against real printers using only the LAN access code
+  (no Bambu account): FTPS returned a real listing, MQTT round-tripped a
+  `pushall`, CTRL completed the `:6000` LOGIN handshake. The credential/personal
+  material is redacted or anonymized; captures stay in the gitignored runtime dir.
+- **CTRL SETUP payload** — the LOGIN handshake is live-verified; the exact
+  genuine SETUP JSON (mtype 12290 fields) that yields a `result:0` reply comes
+  from a real plugin capture. The harness's `NativeTunnelMock` models the full
+  handshake, so `ctrl_storage_list` passes end-to-end today.
 
-**Extensions (schema ready, transport not yet wired):**
+**Manual step (one, unavoidable):** capturing the *genuine plugin's own* traffic
+for MQTT/FTPS/CTRL/HTTPS needs the user's Bambu login + GUI to drive the flow.
+The relays and shim are proven; only the human-driven trigger is manual. SSDP has
+no manual step.
 
-- **MQTT (8883)** — LAN device control. The redirect shim only scopes `:443`;
-  add an `:8883` sentinel + an MQTT-aware proxy (e.g. mitmproxy's raw TCP mode
-  or a small broker relay) and emit `protocol:"mqtt"` steps. The fixture schema
-  already carries MQTT steps.
-- **FTPS (990)** — implicit-FTPS 3mf upload. Needs an FTPS-aware relay to log
-  `STOR`/`LIST`; the harness already models this with `FtpsMock`.
+**Remaining / partial:**
+
+- **`start_print` full lan pipeline** — the FTPS `STOR` (md5 of the uploaded 3mf)
+  and MQTT `project_file` legs reuse `ftps_relay.py`/`mqtt_relay.py`, but a
+  committable fixture also needs the sliced 3mf asset and the HTTP create-task
+  body; wire it by combining an HTTPS + FTPS + MQTT capture of one print.
 - **S3 presigned PUTs** — the 3mf upload bodies go to short-lived S3 URLs on a
-  different host; scope the shim to those hosts or record them as
-  `host:"<presigned>"` steps.
+  different host; scope the shim to those hosts to capture them.
+- Captures containing a user's real file names / device state are used for
+  verification only and are **not** committed (only the tools land in-repo).
 
 ---
 

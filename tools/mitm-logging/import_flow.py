@@ -272,12 +272,240 @@ def recognize_generic(recs, flow, match):
     return steps, vars_, {}
 
 
-RECOGNIZERS = {"login": recognize_login}
+# ---------------------------------------------------------------------------
+# non-HTTP protocols: SSDP / MQTT / FTPS / CTRL
+# ---------------------------------------------------------------------------
+
+# DevModel.bambu.com internal code -> fixture printer_model
+MODEL_MAP = {"N2S": "a1", "O1S": "h2s", "O1D": "h2d", "N1": "p1", "C11": "p1",
+             "C12": "p1", "C13": "x1", "BL-P001": "x1"}
+
+
+def serial_anon(s):
+    """Keep the model-family prefix, zero the rest (no real serial leaks)."""
+    if not s or len(s) < 3:
+        return s
+    return s[:3] + "0" * (len(s) - 3)
+
+
+def parse_ssdp(packet):
+    """Return (ordered [(name,value)], lower->value) preserving case/order."""
+    lines = packet.split("\r\n")
+    pairs = []
+    for ln in lines[1:]:
+        if not ln or ":" not in ln:
+            continue
+        k, v = ln.split(":", 1)
+        pairs.append((k.strip(), v.strip()))
+    low = {k.lower(): v for k, v in pairs}
+    return pairs, low
+
+
+def recognize_ssdp(recs, args):
+    ssdp = [r for r in recs if r.get("_proto") == "ssdp"]
+    if not ssdp:
+        raise SystemExit("ssdp_discovery: no proto=ssdp NOTIFY records in log")
+    # select the packet: by --src, else by --model (DevModel/DevName), else first
+    chosen = None
+    for r in ssdp:
+        _, low = parse_ssdp(r["packet"])
+        if args.src and r.get("src") == args.src:
+            chosen = r
+            break
+        if args.model and args.model != "unknown":
+            dm = MODEL_MAP.get(low.get("devmodel.bambu.com", ""), "")
+            if dm == args.model.lower():
+                chosen = r
+                break
+    if chosen is None:
+        chosen = ssdp[0]
+
+    packet = chosen["packet"]
+    _, low = parse_ssdp(packet)
+    # anonymize IN THE RAW PACKET so header set/order/case is preserved exactly
+    loc = low.get("location", "")
+    usn = low.get("usn", "")
+    apacket = packet
+    if loc:
+        apacket = apacket.replace(loc, "192.168.1.2")
+    if usn:
+        apacket = apacket.replace(usn, serial_anon(usn))
+    _, alow = parse_ssdp(apacket)
+
+    # obn::ssdp::to_device_info_json mapping (dev_signal is always "")
+    expect = {
+        "dev_name": alow.get("devname.bambu.com", ""),
+        "dev_id": alow.get("usn", ""),
+        "dev_ip": alow.get("location", ""),
+        "dev_type": alow.get("devmodel.bambu.com", ""),
+        "dev_signal": "",
+        "connect_type": alow.get("devconnect.bambu.com", ""),
+        "bind_state": alow.get("devbind.bambu.com", ""),
+        "sec_link": alow.get("devseclink.bambu.com", ""),
+        "ssdp_version": alow.get("devversion.bambu.com", ""),
+        "connection_name": alow.get("devinf.bambu.com", ""),
+    }
+    model = args.model if args.model and args.model != "unknown" else \
+        MODEL_MAP.get(low.get("devmodel.bambu.com", ""), "unknown")
+    host_line = apacket.split("\r\n", 2)[1] if "\r\n" in apacket else ""
+    host = host_line.split(":", 1)[1].strip() if ":" in host_line else "239.255.255.250:1900"
+    meta = base_meta(args, flow="ssdp_discovery", channel="lan", model=model,
+                     extra={"command": "ssdp_notify", "protocol": "ssdp"})
+    return {
+        "schema": "obn-wire-flow/v1", "meta": meta,
+        "driver": {"packet": apacket, "expect": expect},
+        "steps": [{
+            "seq": 1, "id": "ssdp_notify", "protocol": "ssdp",
+            "channel_only": "lan",
+            "request": {"host": host, "transport": chosen.get("transport", "udp:2021"),
+                        "op": "NOTIFY" + ("" if "nts:" in apacket.lower() else " (no NTS line)")},
+            "expect": {"device_info":
+                       "{dev_name,dev_id,dev_ip,dev_type,dev_signal,connect_type,"
+                       "bind_state,sec_link,ssdp_version,connection_name}"},
+        }],
+    }
+
+
+TOPIC_REQ_RE = re.compile(r"^device/([^/]+)/request$")
+
+
+def recognize_device_command(recs, args):
+    mq = [r for r in recs if r.get("_proto") == "mqtt"
+          and r.get("event") == "publish"
+          and TOPIC_REQ_RE.match(r.get("topic", ""))]
+    if not mq:
+        raise SystemExit("device_command: no MQTT publish to device/<serial>/request")
+    rec = mq[0]
+    dev = TOPIC_REQ_RE.match(rec["topic"]).group(1)
+    dev_a = serial_anon(dev)
+    payload = json.loads(rec["payload"])
+    signed = "header" in payload and "print" in payload
+    if signed:
+        logical = {"print": payload["print"]}
+    else:
+        logical = payload
+    # the command name lives one level down (system/print/pushing/... .command)
+    command = ""
+    for sub in payload.values():
+        if isinstance(sub, dict) and isinstance(sub.get("command"), str):
+            command = sub["command"]
+            break
+    payload_json = anon(logical)
+    meta = base_meta(args, flow="device_command", channel="cloud_lan",
+                     model=args.model if args.model != "unknown" else "h2d",
+                     extra={"command": command})
+    return {
+        "schema": "obn-wire-flow/v1", "meta": meta,
+        "driver": {"dev_id": dev_a, "access_code": "1234abcd",
+                   "signed": signed, "command_json": json.dumps(anon(logical))},
+        "steps": [{
+            "seq": 1, "id": "publish", "protocol": "mqtt",
+            "channel_only": "cloud_lan",
+            "request": {"topic": "device/{{device_id}}/request",
+                        "signed": signed, "payload_json": payload_json},
+            "expect": {},
+        }],
+    }
+
+
+LIST_LINE_RE = re.compile(
+    r"^([\-d])\S*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(.+)$")
+
+
+def parse_listing(listing, models_only=False):
+    files = []
+    for ln in listing.replace("\r\n", "\n").split("\n"):
+        m = LIST_LINE_RE.match(ln)
+        if not m:
+            continue
+        kind, size, name = m.group(1), int(m.group(2)), m.group(3).strip()
+        if kind == "d":
+            continue
+        # The CTRL type=model listing returns only .3mf model files; the FTPS
+        # storage listing returns every regular file (incl. media).
+        if models_only and not name.lower().endswith(".3mf"):
+            continue
+        files.append({"name": name, "size": size})
+    return files
+
+
+def _ftps_driver(recs, args, models_only):
+    ft = [r for r in recs if r.get("_proto") == "ftps"
+          and r.get("event", "").upper() == "LIST" and r.get("listing")]
+    if not ft:
+        raise SystemExit("no FTPS LIST record with a listing in log")
+    rec = ft[0]
+    dev = serial_anon(rec.get("dev", "090000000000000"))
+    files = parse_listing(rec["listing"], models_only=models_only)
+    return dev, rec["listing"], files
+
+
+def recognize_storage_list(recs, args):
+    dev, listing, files = _ftps_driver(recs, args, models_only=False)
+    meta = base_meta(args, flow="storage_list", channel="cloud_lan",
+                     model=args.model if args.model != "unknown" else "h2s",
+                     extra={"command": "list_info"})
+    return {
+        "schema": "obn-wire-flow/v1", "meta": meta,
+        "driver": {"dev_id": dev, "access_code": "1234abcd",
+                   "listing": listing, "expect_files": files},
+        "steps": [{
+            "seq": 1, "id": "ftps_list", "protocol": "ftp",
+            "channel_only": "cloud_lan",
+            "request": {"host": "{{device_id}}:990", "tls": "implicit-990",
+                        "op": "LIST", "path": "/"},
+            "expect": {"reply": "226 Directory send OK"},
+        }],
+    }
+
+
+def recognize_ctrl_storage_list(recs, args):
+    dev, listing, files = _ftps_driver(recs, args, models_only=True)
+    meta = base_meta(args, flow="ctrl_storage_list", channel="cloud_lan",
+                     model=args.model if args.model != "unknown" else "h2s",
+                     extra={"command": "list_info"})
+    return {
+        "schema": "obn-wire-flow/v1", "meta": meta,
+        "driver": {"dev_id": dev, "access_code": "1234abcd",
+                   "listing": listing, "expect_files": files},
+        "steps": [
+            {"seq": 1, "id": "ctrl_open", "protocol": "tls",
+             "channel_only": "cloud_lan",
+             "request": {"host": "{{device_id}}:6000", "tls": "native-6000",
+                         "op": "handshake",
+                         "frames": "LOGIN(magic 0x0101013F, user+access_code) -> "
+                                   "login-ack(0x0001013F); SETUP(0x0102013F, ctrl json) -> "
+                                   "setup-reply(mtype 12291, result 0)"},
+             "expect": {"reply": "session Ready (ctrl_mode)"}},
+            {"seq": 2, "id": "ctrl_list_info", "protocol": "ftp",
+             "channel_only": "cloud_lan",
+             "request": {"cmdtype": 1, "sequence": 1,
+                         "req": {"type": "model", "storage": ""},
+                         "served_over": "FTPS LIST (force_ftps bridge)"},
+             "expect": {"reply": "{cmdtype:1,sequence:1,result:0,reply:{file_lists:"
+                                 "[{name,path,size,time,date}]}}"}},
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
-# main
+# meta + http fixture builder + main
 # ---------------------------------------------------------------------------
+
+def base_meta(args, flow, channel, model, extra=None):
+    meta = {
+        "os": args.os or "linux",
+        "network_plugin_version": args.net_ver or "02.07.00.50",
+        "slicer_client_version": args.client_ver or "02.07.00.55",
+        "channel": args.channel if args.channel and args.channel != "unknown" else channel,
+        "printer_model": model,
+        "flow": flow,
+        "source": "BambuStudio",
+    }
+    if extra:
+        meta.update(extra)
+    return meta
+
 
 def load_log(path):
     recs = []
@@ -288,24 +516,51 @@ def load_log(path):
                 continue
             d = json.loads(line)
             if "method" in d and "path" in d:
-                recs.append(d)
+                d["_proto"] = "http"
+            else:
+                d["_proto"] = d.get("proto", "unknown")
+            recs.append(d)
     return recs
 
 
-def infer_meta(recs, args):
+def build_http_fixture(recs, args, steps, vars_, defaults):
+    if args.model is None:
+        args.model = defaults.get("printer_model", "unknown")
+    if args.channel is None:
+        args.channel = defaults.get("channel", "unknown")
     ref = next((r for r in recs if has_header(r, "x-bbl-client-version")), recs[0])
     ua = get_header(ref, "user-agent") or ""
     m = re.search(r"bambu_network_agent/(\S+)", ua)
     net_ver = m.group(1) if m else (get_header(ref, "x-bbl-agent-version") or "unknown")
-    return {
+    meta = {
         "os": args.os or (get_header(ref, "x-bbl-os-type") or "linux").lower(),
         "network_plugin_version": net_ver,
         "slicer_client_version": get_header(ref, "x-bbl-client-version") or "unknown",
-        "channel": args.channel,
-        "printer_model": args.model,
-        "flow": args.flow,
-        "source": "BambuStudio",
+        "channel": args.channel, "printer_model": args.model,
+        "flow": args.flow, "source": "BambuStudio",
     }
+    used = []
+    for s in steps:
+        pfx = s["request"]["path"].split("{{")[0]
+        for r in recs:
+            if r.get("_proto") == "http" and r["method"] == s["request"]["method"] \
+               and pfx and r["path"].startswith(pfx):
+                used.append(r)
+    return {
+        "schema": "obn-wire-flow/v1", "meta": meta,
+        "identity_block": build_identity_block(used or [r for r in recs if r.get("_proto") == "http"]),
+        "vars": vars_, "steps": steps,
+    }
+
+
+# driver-based recognizers return a complete fixture dict
+DRIVER_RECOGNIZERS = {
+    "ssdp_discovery": recognize_ssdp,
+    "device_command": recognize_device_command,
+    "storage_list": recognize_storage_list,
+    "ctrl_storage_list": recognize_ctrl_storage_list,
+}
+HTTP_RECOGNIZERS = {"login": recognize_login}
 
 
 def main():
@@ -316,51 +571,43 @@ def main():
     ap.add_argument("--model", default=None, help="printer model or 'account'")
     ap.add_argument("--channel", default=None, help="cloud | cloud_lan | lan")
     ap.add_argument("--os", default=None)
+    ap.add_argument("--src", default=None, help="ssdp: pick the NOTIFY from this source IP")
     ap.add_argument("--match", default=None,
-                    help="generic mode: substring a path must contain")
+                    help="generic http mode: substring a path must contain")
+    ap.add_argument("--net-ver", dest="net_ver", default=None,
+                    help="override meta.network_plugin_version for non-http flows")
+    ap.add_argument("--client-ver", dest="client_ver", default=None,
+                    help="override meta.slicer_client_version for non-http flows")
     ap.add_argument("-o", "--out", default=None)
     args = ap.parse_args()
 
     recs = load_log(args.log)
     if not recs:
-        raise SystemExit("no request records in log")
+        raise SystemExit("no records in log")
 
-    if args.flow in RECOGNIZERS:
-        steps, vars_, defaults = RECOGNIZERS[args.flow](recs)
+    if args.flow in DRIVER_RECOGNIZERS:
+        if args.model is None:
+            args.model = "unknown"
+        fixture = DRIVER_RECOGNIZERS[args.flow](recs, args)
+        nsteps = len(fixture["steps"])
     else:
-        steps, vars_, defaults = recognize_generic(recs, args.flow, args.match)
-
-    # recognizer defaults fill unset model/channel
-    if args.model is None:
-        args.model = defaults.get("printer_model", "unknown")
-    if args.channel is None:
-        args.channel = defaults.get("channel", "unknown")
-
-    # identity block from the records that back the emitted steps
-    used = []
-    for s in steps:
-        for r in recs:
-            if r["method"] == s["request"]["method"] and \
-               s["request"]["path"].split("{{")[0] and \
-               r["path"].startswith(s["request"]["path"].split("{{")[0]):
-                used.append(r)
-    identity = build_identity_block(used or recs)
-
-    fixture = {
-        "schema": "obn-wire-flow/v1",
-        "meta": infer_meta(recs, args),
-        "identity_block": identity,
-        "vars": vars_,
-        "steps": steps,
-    }
+        http = [r for r in recs if r.get("_proto") == "http"]
+        if not http:
+            raise SystemExit(f"flow '{args.flow}' needs HTTP records; none in log")
+        if args.flow in HTTP_RECOGNIZERS:
+            steps, vars_, defaults = HTTP_RECOGNIZERS[args.flow](http)
+        else:
+            steps, vars_, defaults = recognize_generic(http, args.flow, args.match)
+        fixture = build_http_fixture(http, args, steps, vars_, defaults)
+        nsteps = len(steps)
 
     out = json.dumps(fixture, indent=2, ensure_ascii=False)
     if args.out:
         import os
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
         with open(args.out, "w") as f:
             f.write(out + "\n")
-        sys.stderr.write(f"wrote {args.out} ({len(steps)} steps)\n")
+        sys.stderr.write(f"wrote {args.out} ({nsteps} step(s), flow={args.flow})\n")
     else:
         print(out)
 

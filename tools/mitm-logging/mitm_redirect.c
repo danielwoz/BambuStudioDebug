@@ -62,6 +62,23 @@ int getaddrinfo(const char *node, const char *service,
   return r;
 }
 
+/* Steer a matched destination port to 127.0.0.1:<relay> if the paired env var
+ * is set. :443 (cloud REST) is gated on the api.bambulab.com sentinel; the LAN
+ * transports (:8883 MQTT, :990 FTPS, :6000 native CTRL) go to a printer IP, so
+ * they are steered whenever their relay env is set (target one printer at a
+ * time -- the relay is configured with that printer's IP as its upstream). */
+static int redirect_port(unsigned short p, unsigned int h) {
+  const char *rd;
+  if (p == 443) {
+    rd = getenv("REDIRECT_443");
+    return (rd && rd[0] && h == SENTINEL) ? atoi(rd) : 0;
+  }
+  if (p == 8883) { rd = getenv("REDIRECT_8883"); return (rd && rd[0]) ? atoi(rd) : 0; }
+  if (p == 990)  { rd = getenv("REDIRECT_990");  return (rd && rd[0]) ? atoi(rd) : 0; }
+  if (p == 6000) { rd = getenv("REDIRECT_6000"); return (rd && rd[0]) ? atoi(rd) : 0; }
+  return 0;
+}
+
 int connect(int fd, const struct sockaddr *a, socklen_t l) {
   if (!rc)
     rc = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT,
@@ -70,12 +87,12 @@ int connect(int fd, const struct sockaddr *a, socklen_t l) {
     const struct sockaddr_in *s = (const struct sockaddr_in *)a;
     unsigned int h = ntohl(s->sin_addr.s_addr);
     unsigned short p = ntohs(s->sin_port);
-    const char *rd = getenv("REDIRECT_443");
-    if (p == 443 && rd && rd[0] && h == SENTINEL) {
+    int relay = redirect_port(p, h);
+    if (relay) {
       struct sockaddr_in b;
       memcpy(&b, s, sizeof b);
       b.sin_addr.s_addr = htonl(0x7f000001u); /* 127.0.0.1 */
-      b.sin_port = htons((unsigned short)atoi(rd));
+      b.sin_port = htons((unsigned short)relay);
       return rc(fd, (const struct sockaddr *)&b, l);
     }
   }

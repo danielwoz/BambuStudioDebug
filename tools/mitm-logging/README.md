@@ -8,39 +8,42 @@ open-bamboo-networking (OBN) wire-compliance harness. Full design:
 ## Layout
 
 - `mitm_redirect.c` / `build_redirect.sh` — LD_PRELOAD transport shim. Steers
-  ONLY `api.bambulab.com` through a local mitmdump; every other host (login
+  `api.bambulab.com:443` through mitmdump, and (when `REDIRECT_8883/990/6000`
+  are set) the LAN transports to the relays below. Every other host (login
   webview included) stays direct. Disables cert verification on the redirected
-  leg so mitmproxy's interception cert is accepted.
-- `wire_addon.py` — mitmdump addon that appends each request/response to an
-  NDJSON log (method, path, query, ordered headers, body, status).
-- `capture.sh` — one command: builds the shim, starts mitmdump reverse-proxy,
-  launches BambuStudio with the genuine plugin, logging to a gitignored dir.
-- `import_flow.py` — folds a captured log into an anonymized `flow.json`.
+  legs so the interception cert is accepted.
+- `wire_addon.py` — mitmdump addon; one NDJSON line per REST request. (HTTPS)
+- `ssdp_sniff.py` — passive UDP `:2021` sniffer for printer NOTIFY. (SSDP)
+- `mqtt_relay.py` — TLS-terminating MQTT relay for `:8883`. (MQTT)
+- `ftps_relay.py` — implicit-FTPS relay for `:990` (control + PASV data). (FTPS)
+- `ctrl_relay.py` — native CTRL tunnel relay for `:6000`. (CTRL)
+- `capture.sh` — HTTPS orchestrator (shim + mitmdump + slicer).
+- `import_flow.py` — folds any capture log into an anonymized `flow.json`.
 
-## Workflow
+## Protocol -> flow
+
+| Protocol | Capture | `import_flow.py --flow` |
+|----------|---------|--------------------------|
+| HTTPS `:443` | `capture.sh` | `login` (or generic `--match`) |
+| SSDP `:2021` | `ssdp_sniff.py` | `ssdp_discovery` |
+| MQTT `:8883` | `mqtt_relay.py` | `device_command` |
+| FTPS `:990` | `ftps_relay.py` | `storage_list` |
+| CTRL `:6000` | `ctrl_relay.py` (+ ftps) | `ctrl_storage_list` |
+
+## Example (SSDP — fully passive, no credentials)
 
 ```
-# 1. capture (needs a built bambu-studio + the genuine plugin installed)
-tools/mitm-logging/capture.sh --studio ./build/src/bambu-studio
-#    log in, reproduce the problem in the UI, quit. Raw log lands in
-#    ./mitm-captures/http_all.jsonl (gitignored).
-
-# 2. import one flow into an anonymized fixture
-python3 tools/mitm-logging/import_flow.py mitm-captures/http_all.jsonl \
-    --flow login --model account --channel cloud \
-    -o /tmp/flow.json
-
-# 3. drop it into the OBN tree and run the harness
-cp /tmp/flow.json \
-  <obn>/tests/wire-fixtures/linux/02.07.00.50/cloud/account/login/flow.json
-ctest --test-dir <obn>/build -R wire_ --output-on-failure
+python3 ssdp_sniff.py --seconds 20 --out ssdp.jsonl
+python3 import_flow.py ssdp.jsonl --flow ssdp_discovery --model a1 -o /tmp/ssdp.json
+<obn>/build/wire_compliance_test /tmp/ssdp.json
 ```
 
-`import_flow.py` has a precise recognizer for `login` and a generic best-effort
-mode (`--match <path-substring>`) for other flows.
+LAN relays (MQTT/FTPS/CTRL) need only the printer's access code; see
+`../../docs/MITM_LOGGING.md` §4 for the point-and-import recipe per protocol.
 
 ## Security
 
-Raw captures under `mitm-captures/` and the mitmproxy CA key (`~/.mitmproxy/`)
-hold live tokens and personal identifiers — gitignored, **never committed**.
-Only anonymized fixtures from `import_flow.py` are committed.
+Raw captures under `mitm-captures/`, the mitmproxy CA key (`~/.mitmproxy/`), and
+the relay cert/key (`relay_*.pem`) hold live credentials / personal identifiers —
+gitignored, **never committed**. Only anonymized fixtures from `import_flow.py`
+are committed. Relays redact the FTP/CTRL access code and MQTT never logs it.
