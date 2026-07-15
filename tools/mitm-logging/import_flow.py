@@ -45,6 +45,7 @@ DROP_HEADERS = {"content-length", "connection", "accept-encoding", "expect"}
 
 DYNAMIC_VALUE = {
     "x-bbl-device-id": "<dynamic:install-uuid>",
+    "x-bbl-client-id": "<dynamic:slicer:{user_id}:{hex4}>",
 }
 
 
@@ -203,8 +204,9 @@ def build_identity_block(recs):
 TICKET_RE = re.compile(r"^/v1/user-service/user/ticket/([A-Za-z0-9]+)$")
 
 
-def recognize_login(recs):
+def recognize_login(recs, args=None):
     """POST /v1/user-service/user/ticket/{ticket} then GET my/profile."""
+    recs = [r for r in recs if r.get("_proto") == "http"]
     steps, i = [], None
     for idx, r in enumerate(recs):
         if r["method"] == "POST" and TICKET_RE.match(r["path"]):
@@ -241,6 +243,367 @@ def recognize_login(recs):
                     "json": "$.uidStr", "example": "1234567890"},
     }
     return steps, vars_, {"printer_model": "account", "channel": "cloud"}
+
+
+def find_rec(recs, method, path_pred, after=0):
+    for i in range(after, len(recs)):
+        r = recs[i]
+        if r["method"] == method and path_pred(r["path"]):
+            return i, r
+    return -1, None
+
+
+def flags_from(rec):
+    """Header-presence flags for a step, read from the actual record."""
+    return {
+        "block": has_header(rec, "x-bbl-device-id"),
+        "client_id": has_header(rec, "x-bbl-client-id"),
+        "content_type": has_header(rec, "content-type"),
+        "authorization": has_header(rec, "authorization"),
+    }
+
+
+def recognize_filament_manager(recs, args=None):
+    """GET filament/config, GET my/filament/v2 (offset/limit), PUT my/filament/v2."""
+    recs = [r for r in recs if r.get("_proto") == "http"]
+    _, cfg = find_rec(recs, "GET", lambda p: p.endswith("/design-user-service/filament/config"))
+    _, lst = find_rec(recs, "GET", lambda p: p.endswith("/design-user-service/my/filament/v2"))
+    _, put = find_rec(recs, "PUT", lambda p: p.endswith("/design-user-service/my/filament/v2"))
+    if not (cfg and lst and put):
+        raise SystemExit("filament_manager: missing config/list/put filament records")
+    steps = [
+        {"seq": 1, "id": "get_filament_config", "protocol": "http",
+         "request": {"method": "GET", "host": "api.bambulab.com",
+                     "path": "/v1/design-user-service/filament/config",
+                     "headers": flags_from(cfg)},
+         "expect": {"status": 200}},
+        {"seq": 2, "id": "list_filaments", "protocol": "http",
+         "request": {"method": "GET", "host": "api.bambulab.com",
+                     "path": "/v1/design-user-service/my/filament/v2",
+                     "query": {"offset": "{{page_offset}}", "limit": "{{page_limit}}"},
+                     "headers": flags_from(lst)},
+         "expect": {"status": 200}, "captures": {"filament_ids": "$.filaments[*].id"}},
+        {"seq": 3, "id": "edit_filament", "protocol": "http",
+         "request": {"method": "PUT", "host": "api.bambulab.com",
+                     "path": "/v1/design-user-service/my/filament/v2",
+                     "headers": flags_from(put),
+                     "body_json": {"color": "{{color}}", "colors": ["{{color}}"],
+                                   "filamentName": "{{filament_name}}",
+                                   "id": "{{filament_id}}", "note": "{{note}}"}},
+         "expect": {"status": 200}},
+    ]
+    vars_ = {
+        "filament_id": {"kind": "from_response", "step": "list_filaments",
+                        "json": "$.filaments[*].id", "example": 1000001},
+        "filament_name": {"kind": "input", "example": "PETG Basic"},
+        "color": {"kind": "input", "example": "#001489"},
+        "note": {"kind": "input", "example": "obncap"},
+        "page_offset": {"kind": "input", "example": 0},
+        "page_limit": {"kind": "input", "example": 20},
+    }
+    return steps, vars_, {"printer_model": "account", "channel": "cloud"}
+
+
+def recognize_preset_sync(recs, args=None):
+    """GET slicer/setting?version=&public=false, then GET slicer/setting/{id}."""
+    recs = [r for r in recs if r.get("_proto") == "http"]
+    _, lst = find_rec(recs, "GET", lambda p: p.endswith("/iot-service/api/slicer/setting"))
+    _, one = find_rec(recs, "GET", lambda p: "/iot-service/api/slicer/setting/" in p)
+    if not lst:
+        raise SystemExit("preset_sync: no GET /iot-service/api/slicer/setting")
+    steps = [
+        {"seq": 1, "id": "list_settings", "protocol": "http",
+         "request": {"method": "GET", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/slicer/setting",
+                     "query": {"version": "{{bundle_version}}", "public": "false"},
+                     "headers": flags_from(lst)},
+         "expect": {"status": 200}, "captures": {"setting_ids": "$..setting_id"}},
+    ]
+    if one:
+        steps.append(
+            {"seq": 2, "id": "get_setting", "protocol": "http", "repeatable": True,
+             "request": {"method": "GET", "host": "api.bambulab.com",
+                         "path": "/v1/iot-service/api/slicer/setting/{{setting_id}}",
+                         "headers": flags_from(one)},
+             "expect": {"status": 200}})
+    vars_ = {
+        "bundle_version": {"kind": "input", "example": "2.7.0.2"},
+        "setting_id": {"kind": "from_response", "step": "list_settings",
+                       "json": "$..setting_id", "example": "PPUS00000000000004"},
+    }
+    return steps, vars_, {"printer_model": "account", "channel": "cloud"}
+
+
+def recognize_preset_write(recs, args=None):
+    """POST slicer/setting (create), PATCH slicer/setting/{id} (update),
+    DELETE slicer/setting/{id}."""
+    recs = [r for r in recs if r.get("_proto") == "http"]
+    _, cre = find_rec(recs, "POST", lambda p: p.endswith("/iot-service/api/slicer/setting"))
+    _, upd = find_rec(recs, "PATCH", lambda p: "/iot-service/api/slicer/setting/" in p)
+    _, dele = find_rec(recs, "DELETE", lambda p: "/iot-service/api/slicer/setting/" in p)
+    if not cre:
+        raise SystemExit("preset_write: no POST /iot-service/api/slicer/setting")
+    create_body = {
+        "base_id": "{{base_id}}", "name": "{{preset_name}}", "public": False,
+        "setting": {"inherits": "{{inherits}}",
+                    "initial_layer_print_height": "0.24",
+                    "print_extruder_id": "1,1,2,2,2",
+                    "print_extruder_variant": "<diffed values>",
+                    "print_settings_id": "{{preset_name}}", "updated_time": "0"},
+        "type": "{{preset_type}}", "version": "{{bundle_version}}"}
+    steps = [
+        {"seq": 1, "id": "create", "protocol": "http",
+         "request": {"method": "POST", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/slicer/setting",
+                     "headers": flags_from(cre), "body_json": create_body},
+         "expect": {"status": 200}, "captures": {"setting_id": "$.setting_id"}},
+    ]
+    if upd:
+        upd_body = {
+            "base_id": "{{base_id}}", "name": "{{preset_name}}",
+            "setting": {"inherits": "{{inherits}}",
+                        "initial_layer_print_height": "0.28",
+                        "print_extruder_id": "1,1,2,2,2",
+                        "print_extruder_variant": "<diffed values>",
+                        "print_settings_id": "{{preset_name}}",
+                        "updated_time": "{{updated_time}}"},
+            "version": "{{bundle_version}}"}
+        steps.append(
+            {"seq": 2, "id": "update", "protocol": "http",
+             "request": {"method": "PATCH", "host": "api.bambulab.com",
+                         "path": "/v1/iot-service/api/slicer/setting/{{setting_id}}",
+                         "headers": flags_from(upd), "body_json": upd_body},
+             "expect": {"status": 200}})
+    if dele:
+        steps.append(
+            {"seq": 3, "id": "delete", "protocol": "http",
+             "request": {"method": "DELETE", "host": "api.bambulab.com",
+                         "path": "/v1/iot-service/api/slicer/setting/{{setting_id}}",
+                         "headers": flags_from(dele)},
+             "expect": {"status": 200}})
+    vars_ = {
+        "bundle_version": {"kind": "input", "example": "2.7.0.2"},
+        "base_id": {"kind": "input", "example": "GP124"},
+        "inherits": {"kind": "input", "example": "0.20mm Standard @BBL H2D"},
+        "preset_name": {"kind": "input", "example": "obn_write_test"},
+        "preset_type": {"kind": "input", "example": "print"},
+        "updated_time": {"kind": "generated", "example": "1784033404"},
+        "setting_id": {"kind": "from_response", "step": "create",
+                       "json": "$.setting_id", "example": "PPUS00000000000010"},
+    }
+    return steps, vars_, {"printer_model": "account", "channel": "cloud"}
+
+
+def _rep_flags(recs, method, sub):
+    """Header flags from a representative record for method+path-substring."""
+    _, r = find_rec(recs, method, lambda p: sub in p)
+    return flags_from(r) if r else {"block": True, "client_id": True,
+                                    "content_type": True, "authorization": True}
+
+
+def reconstruct_task_driver(body, md5, asset_base):
+    """Invert build_task_body: a create_task body -> the PrintParams driver
+    block the harness feeds test_build_task_body (see cloud_print.cpp)."""
+    def dumps(v):
+        return json.dumps(v, separators=(",", ":")) if v not in (None, [], "") else ""
+    ams2 = [{"ams_id": e.get("amsId", 255), "slot_id": e.get("slotId", 0)}
+            for e in body.get("amsMapping2", [])]
+    return {
+        "project_name": body.get("title", ""),
+        "dev_id": serial_anon(body.get("deviceId", "090000000000000")),
+        "plate_index": body.get("plateIndex", 1),
+        "task_bed_type": body.get("bedType", "auto"),
+        "task_use_ams": body.get("useAms", False),
+        "task_record_timelapse": body.get("timelapse", False),
+        "task_layer_inspect": body.get("layerInspect", False),
+        "task_bed_leveling": body.get("bedLeveling", False),
+        "task_flow_cali": body.get("flowCali", False),
+        "task_vibration_cali": body.get("vibrationCali", False),
+        "auto_bed_leveling": body.get("autoBedLeveling", 2),
+        "auto_flow_cali": body.get("extrudeCaliFlag", 2),
+        "auto_offset_cali": body.get("nozzleOffsetCali", 2),
+        "extruder_cali_manual_mode": body.get("extrudeCaliManualMode", 0),
+        "ftp_file_md5": md5 or "",
+        "ams_mapping": dumps(body.get("amsMapping", [])),
+        "ams_mapping2": dumps(ams2),
+        "ams_mapping_info": dumps(body.get("amsDetailMapping", [])),
+        "nozzles_info": dumps(body.get("nozzleInfos", [])),
+        "asset": "assets/%s.gcode.3mf" % asset_base,
+        "config_asset": "assets/%s_config.3mf" % asset_base,
+    }
+
+
+def _task_step_body(body):
+    """create_task step body_json: the captured body with only the serial
+    anonymized and the per-run fields templated (colors/filament ids are not
+    secrets and must stay literal so test_build_task_body matches)."""
+    b = json.loads(json.dumps(body))   # deep copy
+    b["deviceId"] = serial_anon(body.get("deviceId", "090000000000000"))
+    b["modelId"] = "{{model_id}}"
+    b["profileId"] = "{{profile_id}}"
+    b["sequence_id"] = "{{seq}}"
+    if "oriProfileId" in b:
+        b["oriProfileId"] = 0
+    return b
+
+
+def _cloud_print_steps(recs, task_rec, patch_md5, lan):
+    """Canonical start_print HTTP pipeline. channel_only steps are emitted for
+    both channels; the harness applies them only when meta.channel matches."""
+    tf = flags_from(task_rec)
+    proj_f = _rep_flags(recs, "POST", "/iot-service/api/user/project")
+    notif_f = _rep_flags(recs, "PUT", "/iot-service/api/user/notification")
+    poll_f = _rep_flags(recs, "GET", "/iot-service/api/user/notification")
+    patch_f = _rep_flags(recs, "PATCH", "/iot-service/api/user/project")
+    upl_f = _rep_flags(recs, "GET", "/iot-service/api/user/upload")
+    body = json.loads(task_rec["body"])
+    title = body.get("title", "print")
+    steps = [
+        {"seq": 1, "id": "create_project", "protocol": "http",
+         "request": {"method": "POST", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/user/project",
+                     "headers": proj_f, "body_json": {"name": title}},
+         "expect": {"status": 200},
+         "captures": {"project_id": "$.project_id", "profile_id": "$.profile_id",
+                      "model_id": "$.model_id", "upload_url": "$.upload_url",
+                      "upload_ticket": "$.upload_ticket"}},
+        {"seq": 2, "id": "upload_config_3mf", "protocol": "http",
+         "request": {"method": "PUT", "host": "<presigned>", "path": "{{upload_url}}",
+                     "headers": {"block": False, "content_type_removed": True,
+                                 "expect_removed": True},
+                     "body_raw": "<config .3mf bytes>"}, "expect": {"status": 200}},
+        {"seq": 3, "id": "notify_upload", "protocol": "http",
+         "request": {"method": "PUT", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/user/notification", "headers": notif_f,
+                     "body_json": {"upload": {"origin_file_name": "{{config_file_name}}",
+                                              "ticket": "{{upload_ticket}}"}}},
+         "expect": {"status": 200}},
+        {"seq": 4, "id": "poll_upload", "protocol": "http", "repeatable": True,
+         "request": {"method": "GET", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/user/notification",
+                     "query": {"action": "upload", "ticket": "{{upload_ticket}}"},
+                     "headers": poll_f}, "expect": {"status": 200}},
+        {"seq": 5, "id": "patch_project_placeholder", "protocol": "http",
+         "channel_only": "cloud_lan",
+         "request": {"method": "PATCH", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/user/project/{{project_id}}",
+                     "headers": patch_f,
+                     "body_json": {"profile_id": "{{profile_id}}",
+                                   "profile_print_3mf": [{"md5": "{{gcode_md5}}",
+                                       "plate_idx": "{{plate_index}}",
+                                       "url": "ftp://%s.gcode.3mf" % title}]}},
+         "expect": {"status": 200}},
+        {"seq": 6, "id": "get_my_setting", "protocol": "http", "channel_only": "cloud_lan",
+         "request": {"method": "GET", "host": "api.bambulab.com",
+                     "path": "/v1/user-service/my/setting",
+                     "headers": _rep_flags(recs, "GET", "/user-service/my/setting")},
+         "expect": {"status": 200}},
+        {"seq": 7, "id": "get_upload_url", "protocol": "http",
+         "request": {"method": "GET", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/user/upload",
+                     "query": {"models": "{{model_id}}_{{profile_id}}_{{plate_index}}.3mf"},
+                     "headers": upl_f}, "expect": {"status": 200},
+         "captures": {"main_upload_url": "$.urls[0].url"}},
+        {"seq": 8, "id": "upload_main_3mf", "protocol": "http",
+         "request": {"method": "PUT", "host": "<presigned>", "path": "{{main_upload_url}}",
+                     "headers": {"block": False, "content_type_removed": True,
+                                 "expect_removed": True},
+                     "body_raw": "<print-ready .3mf (with gcode) bytes>"},
+         "expect": {"status": 200}},
+        {"seq": 9, "id": "patch_project_real", "protocol": "http",
+         "request": {"method": "PATCH", "host": "api.bambulab.com",
+                     "path": "/v1/iot-service/api/user/project/{{project_id}}",
+                     "headers": patch_f,
+                     "body_json": {"profile_id": "{{profile_id}}",
+                                   "profile_print_3mf": [{"md5": "{{gcode_md5}}",
+                                       "plate_idx": "{{plate_index}}",
+                                       "url": "{{main_upload_url}}"}]}},
+         "expect": {"status": 200}},
+        {"seq": 10, "id": "create_task", "protocol": "http", "body_builder": True,
+         "request": {"method": "POST", "host": "api.bambulab.com",
+                     "path": "/v1/user-service/my/task", "headers": tf,
+                     "body_json": _task_step_body(body)},
+         "expect": {"status": 200}, "captures": {"task_id": "$.id"}},
+        {"seq": 11, "id": "poll_task", "protocol": "http", "repeatable": True,
+         "request": {"method": "GET", "host": "api.bambulab.com",
+                     "path": "/v1/user-service/my/task/{{task_id}}",
+                     "headers": _rep_flags(recs, "GET", "/user-service/my/task/")},
+         "expect": {"status": 200}},
+        {"seq": 12, "id": "mqtt_publish_project_file", "protocol": "mqtt",
+         "channel_only": "cloud_lan",
+         "request": {"topic": "device/{{device_id}}/request",
+                     "payload_hint": "print.project_file (lan channel)"}, "expect": {}},
+    ]
+    return steps
+
+
+CLOUD_PRINT_VARS = {
+    "job_name": {"kind": "input", "example": "box20"},
+    "plate_index": {"kind": "input", "example": 1},
+    "device_id": {"kind": "session", "example": "090000000000001"},
+    "user_id": {"kind": "session", "example": "1234567890"},
+    "project_id": {"kind": "from_response", "step": "create_project", "json": "$.project_id", "example": "899112871"},
+    "profile_id": {"kind": "from_response", "step": "create_project", "json": "$.profile_id", "example": "874668027"},
+    "model_id": {"kind": "from_response", "step": "create_project", "json": "$.model_id", "example": "US00000000000001"},
+    "upload_url": {"kind": "from_response", "step": "create_project", "json": "$.upload_url", "example": "<presigned S3 url>"},
+    "upload_ticket": {"kind": "from_response", "step": "create_project", "json": "$.upload_ticket", "example": "uploader_..."},
+    "config_file_name": {"kind": "generated", "example": ".1_config.3mf"},
+    "gcode_md5": {"kind": "input", "example": "C243A8A7648BDB3ECF89978D795105B7"},
+    "main_upload_url": {"kind": "from_response", "step": "get_upload_url", "json": "$.urls[0].url", "example": "<presigned S3 url>"},
+    "seq": {"kind": "generated", "example": "20001"},
+    "task_id": {"kind": "from_response", "step": "create_task", "json": "$.id", "example": "1090332016"},
+}
+
+
+def _find_create_task(recs, mode, dev=None, title=None):
+    for i, r in enumerate(recs):
+        if r["method"] == "POST" and r["path"] == "/v1/user-service/my/task" and r.get("body"):
+            try:
+                b = json.loads(r["body"])
+            except ValueError:
+                continue
+            if b.get("mode") == mode and (dev is None or b.get("deviceId") == dev) \
+               and (title is None or b.get("title") == title):
+                return i, r
+    return -1, None
+
+
+def _patch_md5(recs):
+    for r in recs:
+        if r["method"] == "PATCH" and "/iot-service/api/user/project" in r["path"] and r.get("body"):
+            try:
+                arr = json.loads(r["body"]).get("profile_print_3mf", [])
+                if arr and arr[0].get("md5"):
+                    return arr[0]["md5"]
+            except ValueError:
+                pass
+    return ""
+
+
+def recognize_cloud_print(recs, args=None):
+    recs = [r for r in recs if r.get("_proto") == "http"]
+    channel = (args.channel if args and args.channel and args.channel != "unknown"
+               else "cloud")
+    mode = "lan_file" if channel == "cloud_lan" else "cloud_file"
+    dev = getattr(args, "dev", None) if args else None
+    title = getattr(args, "print_title", None) if args else None
+    _, task = _find_create_task(recs, mode, dev, title)
+    if not task:
+        raise SystemExit(f"cloud_print: no POST /my/task with mode={mode}"
+                         + (f" dev={dev}" if dev else "")
+                         + (f" title={title}" if title else ""))
+    body = json.loads(task["body"])
+    md5 = _patch_md5(recs)
+    asset_base = body.get("title", "print").replace(" ", "_")
+    lan = channel == "cloud_lan"
+    steps = _cloud_print_steps(recs, task, md5, lan)
+    driver = reconstruct_task_driver(body, md5, asset_base)
+    if lan:
+        driver["access_code"] = "1234abcd"
+    model = args.model if args and args.model and args.model != "unknown" else "h2s"
+    defaults = {"printer_model": model, "channel": channel,
+                "flow": "start_print", "_driver": driver}
+    return steps, dict(CLOUD_PRINT_VARS), defaults
 
 
 NUM_SEG_RE = re.compile(r"/(\d{5,})(?=/|$)")
@@ -489,6 +852,93 @@ def recognize_ctrl_storage_list(recs, args):
 
 
 # ---------------------------------------------------------------------------
+# composite flows: merge http + ftps + mqtt captures into one fixture
+# ---------------------------------------------------------------------------
+
+def _find_ftps_stor(recs):
+    for r in recs:
+        if r.get("_proto") == "ftps" and r.get("event", "").upper() == "STOR":
+            return r
+    return None
+
+
+def _find_mqtt_project_file(recs):
+    for r in recs:
+        if r.get("_proto") == "mqtt" and r.get("event") == "publish" \
+           and TOPIC_REQ_RE.match(r.get("topic", "")):
+            try:
+                pl = json.loads(r.get("payload", "{}"))
+            except ValueError:
+                continue
+            pr = pl.get("print", {})
+            if isinstance(pr, dict) and pr.get("command") == "project_file":
+                return r, pr.get("url", "")
+    return None, ""
+
+
+def recognize_hybrid_print(recs, args):
+    """cloud_lan (mode=lan_file): the full api pipeline PLUS the LAN legs.
+    Merges the HTTP create-task/project sequence with the FTPS STOR (md5 of the
+    sliced 3mf) and the MQTT project_file publish."""
+    if args.channel in (None, "unknown"):
+        args.channel = "cloud_lan"
+    steps, vars_, defaults = recognize_cloud_print(recs, args)
+    driver = defaults["_driver"]
+    stor = _find_ftps_stor(recs)
+    if stor:
+        driver["ftp_file_md5"] = (stor.get("md5") or driver.get("ftp_file_md5", "")).upper()
+        fname = stor.get("filename") or ""
+        if fname:
+            base = fname[:-len(".gcode.3mf")] if fname.endswith(".gcode.3mf") else \
+                   fname.rsplit(".", 1)[0]
+            driver["asset"] = "assets/%s.gcode.3mf" % base
+            driver["config_asset"] = "assets/%s_config.3mf" % base
+    driver.setdefault("access_code", "1234abcd")
+    # populate the MQTT project_file step url from the mqtt capture if present
+    _, url = _find_mqtt_project_file(recs)
+    for s in steps:
+        if s.get("id") == "mqtt_publish_project_file" and url:
+            s["request"]["url"] = anon_str(url)
+    defaults["flow"] = "start_print"
+    return steps, vars_, defaults
+
+
+def recognize_lan_print(recs, args):
+    """pure LAN (channel=lan): FTPS STOR + MQTT project_file only, no cloud.
+    NOTE: the OBN harness has no `lan` start_print driver yet -- this fixture is
+    verified structurally; a harness driver is the remaining obn-repo piece."""
+    stor = _find_ftps_stor(recs)
+    mrec, url = _find_mqtt_project_file(recs)
+    if not stor and not mrec:
+        raise SystemExit("lan_print: need an FTPS STOR and/or MQTT project_file record")
+    dev = serial_anon((stor or {}).get("dev") or "090000000000000")
+    fname = (stor or {}).get("filename") or "print.gcode.3mf"
+    base = fname[:-len(".gcode.3mf")] if fname.endswith(".gcode.3mf") else fname.rsplit(".", 1)[0]
+    md5 = ((stor or {}).get("md5") or "").upper()
+    model = args.model if args.model and args.model != "unknown" else "h2s"
+    meta = base_meta(args, flow="start_print", channel="lan", model=model,
+                     extra={"command": "start_local_print"})
+    driver = {"dev_id": dev, "access_code": "1234abcd",
+              "asset": "assets/%s.gcode.3mf" % base, "ftp_file_md5": md5,
+              "plate_index": 1}
+    steps = [
+        {"seq": 1, "id": "ftps_stor", "protocol": "ftp", "channel_only": "lan",
+         "request": {"host": "{{device_id}}:990", "tls": "implicit-990",
+                     "op": "STOR", "path": "/%s.gcode.3mf" % base,
+                     "md5": "{{ftp_file_md5}}"},
+         "expect": {"reply": "226 Transfer complete"}},
+        {"seq": 2, "id": "mqtt_publish_project_file", "protocol": "mqtt",
+         "channel_only": "lan",
+         "request": {"topic": "device/{{device_id}}/request",
+                     "url": anon_str(url) if url else "ftp://%s.gcode.3mf" % base,
+                     "payload_hint": "print.project_file (lan channel, cleartext ftp:// url)"},
+         "expect": {}},
+    ]
+    return {"schema": "obn-wire-flow/v1", "meta": meta, "driver": driver,
+            "steps": steps}
+
+
+# ---------------------------------------------------------------------------
 # meta + http fixture builder + main
 # ---------------------------------------------------------------------------
 
@@ -537,20 +987,25 @@ def build_http_fixture(recs, args, steps, vars_, defaults):
         "network_plugin_version": net_ver,
         "slicer_client_version": get_header(ref, "x-bbl-client-version") or "unknown",
         "channel": args.channel, "printer_model": args.model,
-        "flow": args.flow, "source": "BambuStudio",
+        "flow": defaults.get("flow", args.flow), "source": "BambuStudio",
     }
     used = []
     for s in steps:
+        if s.get("protocol") != "http":
+            continue
         pfx = s["request"]["path"].split("{{")[0]
         for r in recs:
             if r.get("_proto") == "http" and r["method"] == s["request"]["method"] \
                and pfx and r["path"].startswith(pfx):
                 used.append(r)
-    return {
+    fixture = {
         "schema": "obn-wire-flow/v1", "meta": meta,
         "identity_block": build_identity_block(used or [r for r in recs if r.get("_proto") == "http"]),
         "vars": vars_, "steps": steps,
     }
+    if defaults.get("_driver") is not None:
+        fixture["driver"] = defaults["_driver"]
+    return fixture
 
 
 # driver-based recognizers return a complete fixture dict
@@ -560,18 +1015,32 @@ DRIVER_RECOGNIZERS = {
     "storage_list": recognize_storage_list,
     "ctrl_storage_list": recognize_ctrl_storage_list,
 }
-HTTP_RECOGNIZERS = {"login": recognize_login}
+HTTP_RECOGNIZERS = {
+    "login": recognize_login,
+    "filament_manager": recognize_filament_manager,
+    "preset_sync": recognize_preset_sync,
+    "preset_write": recognize_preset_write,
+    "cloud_print": recognize_cloud_print,
+    "hybrid_print": recognize_hybrid_print,   # composite (http + ftps + mqtt)
+}
+# lan_print returns a complete fixture dict (no HTTP identity block)
+FULL_RECOGNIZERS = {"lan_print": recognize_lan_print}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("log")
+    ap.add_argument("log", nargs="+",
+                    help="one or more capture logs, or a session directory "
+                         "(*.jsonl merged) for composite flows")
     ap.add_argument("--flow", required=True)
     ap.add_argument("--model", default=None, help="printer model or 'account'")
     ap.add_argument("--channel", default=None, help="cloud | cloud_lan | lan")
     ap.add_argument("--os", default=None)
     ap.add_argument("--src", default=None, help="ssdp: pick the NOTIFY from this source IP")
+    ap.add_argument("--dev", default=None, help="cloud/hybrid print: pick the create_task by deviceId")
+    ap.add_argument("--print-title", dest="print_title", default=None,
+                    help="cloud/hybrid print: pick the create_task by title")
     ap.add_argument("--match", default=None,
                     help="generic http mode: substring a path must contain")
     ap.add_argument("--net-ver", dest="net_ver", default=None,
@@ -581,21 +1050,33 @@ def main():
     ap.add_argument("-o", "--out", default=None)
     args = ap.parse_args()
 
-    recs = load_log(args.log)
+    import os
+    paths = []
+    for p in args.log:
+        if os.path.isdir(p):
+            paths += sorted(os.path.join(p, f) for f in os.listdir(p) if f.endswith(".jsonl"))
+        else:
+            paths.append(p)
+    recs = []
+    for p in paths:
+        recs += load_log(p)
     if not recs:
-        raise SystemExit("no records in log")
+        raise SystemExit("no records in log(s)")
+    if args.model is None:
+        args.model = "unknown"
 
     if args.flow in DRIVER_RECOGNIZERS:
-        if args.model is None:
-            args.model = "unknown"
         fixture = DRIVER_RECOGNIZERS[args.flow](recs, args)
+        nsteps = len(fixture["steps"])
+    elif args.flow in FULL_RECOGNIZERS:
+        fixture = FULL_RECOGNIZERS[args.flow](recs, args)
         nsteps = len(fixture["steps"])
     else:
         http = [r for r in recs if r.get("_proto") == "http"]
         if not http:
             raise SystemExit(f"flow '{args.flow}' needs HTTP records; none in log")
         if args.flow in HTTP_RECOGNIZERS:
-            steps, vars_, defaults = HTTP_RECOGNIZERS[args.flow](http)
+            steps, vars_, defaults = HTTP_RECOGNIZERS[args.flow](recs, args)
         else:
             steps, vars_, defaults = recognize_generic(http, args.flow, args.match)
         fixture = build_http_fixture(http, args, steps, vars_, defaults)

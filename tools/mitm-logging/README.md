@@ -24,11 +24,12 @@ open-bamboo-networking (OBN) wire-compliance harness. Full design:
 
 | Protocol | Capture | `import_flow.py --flow` |
 |----------|---------|--------------------------|
-| HTTPS `:443` | `capture.sh` | `login` (or generic `--match`) |
+| HTTPS `:443` | `capture.sh` | `login`, `filament_manager`, `preset_sync`, `preset_write`, `cloud_print` (or generic `--match`) |
 | SSDP `:2021` | `ssdp_sniff.py` | `ssdp_discovery` |
 | MQTT `:8883` | `mqtt_relay.py` | `device_command` |
 | FTPS `:990` | `ftps_relay.py` | `storage_list` |
 | CTRL `:6000` | `ctrl_relay.py` (+ ftps) | `ctrl_storage_list` |
+| composite | http + ftps + mqtt (multi-log / session dir) | `hybrid_print`, `lan_print` |
 
 ## Example (SSDP — fully passive, no credentials)
 

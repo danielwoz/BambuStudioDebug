@@ -146,7 +146,9 @@ def handle(client_ss, args, fh, srv_ctx):
                 txt = line.decode("latin1").strip()
                 cmd = txt.split(" ", 1)[0].upper()
                 arg = txt[len(cmd):].strip()
-                if cmd in ("USER", "PASS", "PBSZ", "PROT", "STOR", "LIST", "NLST", "CWD", "TYPE"):
+                # STOR/LIST/NLST are logged by pump_data with md5/listing; log the
+                # rest of the control commands here.
+                if cmd in ("USER", "PASS", "PBSZ", "PROT", "CWD", "TYPE"):
                     ev = {"proto": "ftps", "event": cmd, "dev": dev}
                     if cmd == "PASS":
                         ev["arg"] = "<access_code>"     # never log the real code

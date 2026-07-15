@@ -156,9 +156,44 @@ harness's `body_builder`/`ftp_file_md5` path.
   + `driver.expect_files` (all regular files, name+size).
 - `ctrl_storage_list` (CTRL) — same `listing` served over the FTPS bridge;
   `expect_files` filtered to `.3mf` model files (the `type=model` listing).
+- `filament_manager` (HTTP) — GET `filament/config`, GET `my/filament/v2`
+  (offset/limit), PUT `my/filament/v2` (templated body).
+- `preset_sync` (HTTP) — GET `slicer/setting?version=&public=false` then the
+  repeatable GET `slicer/setting/{{setting_id}}`.
+- `preset_write` (HTTP) — POST `slicer/setting` (create), PATCH
+  `slicer/setting/{{setting_id}}` (update), DELETE `slicer/setting/{{setting_id}}`.
+- `cloud_print` (HTTP, `meta.flow=start_print`) — the full api.bambulab.com print
+  pipeline (create_project, S3 config/main PUTs, notify/poll, get-upload,
+  patch_project, create_task, poll_task). Reconstructs the `driver` PrintParams
+  by inverting `build_task_body` on the captured `POST /my/task` body (amsMapping /
+  amsMapping2 key-rename / amsDetailMapping / bed / cali flags). `--channel cloud`
+  → `mode=cloud_file`; select the task with `--print-title` / `--dev`.
+- `hybrid_print` (composite: HTTP + FTPS + MQTT, `meta.flow=start_print`,
+  `channel=cloud_lan`) — the full pipeline PLUS the LAN legs: `driver.ftp_file_md5`
+  from the captured FTPS `STOR`, and the MQTT `project_file` publish url. Pass the
+  three logs (or a session dir) as multiple inputs.
+- `lan_print` (composite: FTPS + MQTT, `channel=lan`) — pure LAN
+  (`start_local_print`): FTPS `STOR` + MQTT `project_file` only, zero
+  api.bambulab.com steps.
+
+The print flows need the sliced 3mf under `assets/` (the api-scoped MITM does not
+see the S3/FTPS upload bodies, only their md5); supply it from the slice, then the
+harness uploads it and asserts the md5.
 
 Any HTTP flow without a named recognizer uses a generic best-effort mode
 (`--match <path-substring>`) that templatizes long numeric path segments.
+
+### Composite (multi-log) import
+
+`import_flow.py` accepts multiple capture logs or a session directory and merges
+them by protocol:
+
+```
+import_flow.py http_all.jsonl ftps.jsonl mqtt.jsonl --flow hybrid_print \
+    --channel cloud_lan --model h2s --dev <serial> -o flow.json
+# or point at a directory of *.jsonl:
+import_flow.py ./session-dir --flow hybrid_print --channel cloud_lan --model h2s
+```
 
 ### Anonymization (applied to every emitted value)
 
@@ -239,10 +274,33 @@ All five protocols verified on Linux; each generated fixture is accepted by
 | Protocol / flow | Verified against | Result |
 |-----------------|------------------|--------|
 | HTTPS `login` | genuine capture (`http_all.jsonl`) | fixture passes; perturbation reports the concrete diff |
+| HTTPS `filament_manager` | genuine capture | harness OK (3 requests) |
+| HTTPS `preset_sync` | genuine capture | harness OK |
+| HTTPS `preset_write` | genuine capture | harness OK (3 requests) |
+| HTTPS `cloud_print` (start_print, cloud_file) | genuine capture + sliced 3mf assets | harness OK (10 requests; create_task cloud_file body-builder) |
+| Composite `hybrid_print` (start_print, lan_file) | genuine HTTP + **live** FTPS `STOR` md5 + replay MQTT `project_file` | `drive_lan_start_print` OK (create_task lan_file + STOR md5 match + project_file ftp:// url) |
+| Composite `lan_print` (pure LAN) | genuine FTPS `STOR` + replay MQTT | **structural only** — no harness `lan` driver yet (see below) |
 | SSDP `ssdp_discovery` (a1 + h2s) | **live** real printer NOTIFY broadcasts on `:2021` | parse + live UDP listener pass |
 | MQTT `device_command` | **live** relay to a real printer `:8883` (CONNACK + PUBACK from the printer) | `MqttBrokerMock` matches |
 | FTPS `storage_list` | **live** relay to a real printer `:990` (real directory LIST, TLS session reuse) | `FtpsMock` parses all files |
 | CTRL `ctrl_storage_list` | **live** `:6000` LOGIN handshake against a real printer + full harness `NativeTunnelMock`+`FtpsMock` run | handshake accepted; harness passes |
+
+**`lan_print` — remaining obn-repo piece.** The OBN harness dispatches
+`meta.flow=start_print` to the cloud/cloud_lan drivers only; there is no pure
+`lan` (`start_local_print` → `run_local_print_job`) driver. Running a `lan`
+fixture today falls through to the cloud driver and reports a **vacuous** OK
+(it emits `create_project` and finds no HTTP steps to check — it does not
+exercise the FTPS `STOR` / MQTT `project_file` legs). The fixture the importer
+produces is structurally complete (STOR step with `{{ftp_file_md5}}` + MQTT
+`project_file` step + `driver`); adding a `lan` driver in the obn repo
+(analogous to `drive_lan_start_print` but with no api pipeline) is the missing
+piece. This tool does not modify the obn repo.
+
+**Print-flow assets.** `cloud_print` / `hybrid_print` need the sliced 3mf under
+the fixture's `assets/` (the api-scoped MITM never sees the S3/FTPS upload
+bodies, only their md5). For verification the box20 slice from the existing
+`cloud/h2s/start_print` fixture was used (its md5 matches the live FTPS `STOR`
+captured through the relay: `c243a8a7…`).
 
 **What "live" means per protocol:**
 
@@ -265,12 +323,16 @@ no manual step.
 
 **Remaining / partial:**
 
-- **`start_print` full lan pipeline** — the FTPS `STOR` (md5 of the uploaded 3mf)
-  and MQTT `project_file` legs reuse `ftps_relay.py`/`mqtt_relay.py`, but a
-  committable fixture also needs the sliced 3mf asset and the HTTP create-task
-  body; wire it by combining an HTTPS + FTPS + MQTT capture of one print.
+- **`lan_print` harness driver** — the fixture is produced and structurally
+  verified; a pure-`lan` driver in the obn repo is the missing verification piece
+  (see the verification table above).
 - **S3 presigned PUTs** — the 3mf upload bodies go to short-lived S3 URLs on a
-  different host; scope the shim to those hosts to capture them.
+  different host; the api-scoped MITM records only their md5 (enough for the
+  fixture). Scope the shim to those hosts to capture the bodies themselves.
+- **MQTT `project_file` capture** — for `hybrid_print`/`lan_print` a *live*
+  project_file publish would start a print, so the MQTT `project_file` step url
+  is populated from a replay record; the FTPS `STOR` md5 (the load-bearing field
+  the harness asserts) is captured live.
 - Captures containing a user's real file names / device state are used for
   verification only and are **not** committed (only the tools land in-repo).
 
