@@ -48,6 +48,7 @@ fixture-skeletons/
 tools/mitm-logging/mitm_redirect.so
 tools/mitm-logging/abi_tap/abi_tap.so
 tools/mitm-logging/abi_tap/stub_plugin.so
+tools/mitm-logging/abi_tap/probe
 tools/mitm-logging/relay_cert.pem
 tools/mitm-logging/relay_key.pem
 __pycache__/

@@ -73,3 +73,33 @@ and return values passed through. Part B loads the real VMProtect'd plugin (if
 present at `~/.cache/bambu_extract_d/plugins/02.07.01.51/libbambu_networking.so`)
 and calls `get_version` through the tap to prove interposition works against the
 actual module.
+
+## Real-plugin validation (headless probe, no GUI)
+
+`probe_genuine.sh <dev_id> <ip> <access_code>` drives the genuine plugin end to
+end without BambuStudio: it sets the callbacks + cert file the plugin needs, runs
+SSDP discovery so the plugin snapshots the printer cert, `connect_printer`s to a
+real LAN printer, and sends ONE **read-only pushall** (safe). Validated against
+the genuine `02.07.01.51` plugin + a real H2S — the tap captured the genuine
+`get_version`, `create_agent`, `set_config_dir`, `connect_printer` and
+`send_message_to_printer` calls (password redacted), and
+`import_flow.py --flow device_command` turned the capture into an `abi-captured`
+fixture that passes the OBN harness (`WIRE-COMPLIANCE OK`).
+
+**Safety.** `probe_genuine.sh` defaults to a read-only status request. Never send
+`print.*` to a real printer with it. An out-of-band hard stop is
+`obn_send_command <cfg> <dev_id> <ip> <access_code> stop.json` with
+`OBN_SKIP_TLS_VERIFY=1` (signs `print.command=stop`) — keep it armed.
+
+## Driving BambuStudio (Xvfb) — version-match requirement
+
+To capture a genuine **print** with Studio constructing the real `PrintParams`,
+Studio must load the *genuine* plugin, which its gate only accepts when
+`get_version.substr(0,8) == SLIC3R_VERSION.substr(0,8)`. So the genuine plugin
+must match the Studio version (local genuine plugins: `02.07.00.50`,
+`02.07.01.51`). A prebuilt Studio at a different version (e.g. `02.06.01.55`)
+shows *"Please install the network plugin"* and cannot LAN-print until a
+version-matched genuine plugin is installed/downloaded. With a matched Studio,
+add `abi_tap.so` to `LD_PRELOAD` next to `mitm_redirect.so`, run under Xvfb, drive
+the print, and (per printer safety) cancel during the pre-extrusion heating
+window or fire the stop kill-switch.
