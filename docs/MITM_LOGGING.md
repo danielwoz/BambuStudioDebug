@@ -87,7 +87,20 @@ verification on the redirected leg is simpler and equally contained.
 | `ftps_relay.py` | implicit-FTPS relay for `:990` (control + PASV data, TLS session reuse). | FTPS |
 | `ctrl_relay.py` | native CTRL tunnel relay for `:6000` (16-byte framed handshake). | CTRL |
 | `capture.sh` | HTTPS orchestrator: build shim, start mitmdump, launch the slicer. | HTTPS |
+| `abi_tap/` | LD_PRELOAD `dlsym` interposition tap: captures the INPUT args the host passes into the genuine plugin (`PrintParams`, JSON commands, dev_id). See `abi_tap/README.md`. | ABI inputs |
 | `import_flow.py` | any capture log -> anonymized `obn-wire-flow/v1` `flow.json`. | all |
+
+### Input side vs output side
+
+The wire MITM + relays record what the genuine plugin **emits** (→ fixture
+`steps`). The **ABI tap** (`abi_tap/`) records what BambuStudio **hands the
+plugin** (→ fixture `driver`), captured ground-truth instead of reconstructed by
+inverting the wire output. `import_flow.py` merges an `abi_tap.jsonl` with the
+wire logs: where a tapped input exists it is preferred (`meta.driver_source ==
+"abi-captured"`), otherwise reconstruction is the fallback
+(`"reconstructed"`). The tap is `dlsym`-interposition only — the genuine `.so` is
+neither modified nor ptraced, so its VMProtect anti-debug and Studio's
+cert/version/debug gates pass. Full design: `abi_tap/README.md`.
 
 ### Complete protocol coverage -> harness flows
 

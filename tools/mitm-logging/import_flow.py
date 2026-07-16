@@ -401,6 +401,56 @@ def _rep_flags(recs, method, sub):
                                     "content_type": True, "authorization": True}
 
 
+def abi_records(recs, fns):
+    """ABI-tap records whose fn is in `fns` (ground-truth captured inputs)."""
+    fset = set(fns)
+    return [r for r in recs if r.get("_proto") == "abi" and r.get("fn") in fset]
+
+
+def driver_from_captured_params(params, lan):
+    """Build the fixture driver DIRECTLY from a captured PrintParams (ABI tap) --
+    ground truth, no inversion. Fields map 1:1 to params_from_driver."""
+    import os as _os
+
+    def asset(path, suffix):
+        base = _os.path.basename(path or "")
+        if not base:
+            return "assets/print%s" % suffix
+        # strip a trailing .gcode.3mf / .3mf so we can re-add the wanted suffix
+        for ext in (".gcode.3mf", ".3mf"):
+            if base.endswith(ext):
+                base = base[: -len(ext)]
+                break
+        return "assets/%s%s" % (base, suffix)
+
+    d = {
+        "project_name": params.get("project_name") or params.get("task_name", ""),
+        "dev_id": serial_anon(params.get("dev_id", "090000000000000")),
+        "plate_index": params.get("plate_index", 1),
+        "task_bed_type": params.get("task_bed_type", "auto"),
+        "task_use_ams": params.get("task_use_ams", False),
+        "task_record_timelapse": params.get("task_record_timelapse", False),
+        "task_layer_inspect": params.get("task_layer_inspect", False),
+        "task_bed_leveling": params.get("task_bed_leveling", False),
+        "task_flow_cali": params.get("task_flow_cali", False),
+        "task_vibration_cali": params.get("task_vibration_cali", False),
+        "auto_bed_leveling": params.get("auto_bed_leveling", 0),
+        "auto_flow_cali": params.get("auto_flow_cali", 0),
+        "auto_offset_cali": params.get("auto_offset_cali", 0),
+        "extruder_cali_manual_mode": params.get("extruder_cali_manual_mode", -1),
+        "ftp_file_md5": (params.get("ftp_file_md5", "") or "").upper(),
+        "ams_mapping": params.get("ams_mapping", ""),
+        "ams_mapping2": params.get("ams_mapping2", ""),
+        "ams_mapping_info": params.get("ams_mapping_info", ""),
+        "nozzles_info": params.get("nozzles_info", ""),
+        "asset": asset(params.get("filename"), ".gcode.3mf"),
+        "config_asset": asset(params.get("config_filename"), "_config.3mf"),
+    }
+    if lan:
+        d["access_code"] = "1234abcd"   # password is redacted in the tap log
+    return d
+
+
 def reconstruct_task_driver(body, md5, asset_base):
     """Invert build_task_body: a create_task body -> the PrintParams driver
     block the harness feeds test_build_task_body (see cloud_print.cpp)."""
@@ -581,28 +631,38 @@ def _patch_md5(recs):
 
 
 def recognize_cloud_print(recs, args=None):
-    recs = [r for r in recs if r.get("_proto") == "http"]
+    abi = abi_records(recs, ("start_print", "start_local_print",
+                             "start_local_print_with_record"))
+    http = [r for r in recs if r.get("_proto") == "http"]
     channel = (args.channel if args and args.channel and args.channel != "unknown"
                else "cloud")
     mode = "lan_file" if channel == "cloud_lan" else "cloud_file"
     dev = getattr(args, "dev", None) if args else None
     title = getattr(args, "print_title", None) if args else None
-    _, task = _find_create_task(recs, mode, dev, title)
+    _, task = _find_create_task(http, mode, dev, title)
     if not task:
         raise SystemExit(f"cloud_print: no POST /my/task with mode={mode}"
                          + (f" dev={dev}" if dev else "")
                          + (f" title={title}" if title else ""))
     body = json.loads(task["body"])
-    md5 = _patch_md5(recs)
+    md5 = _patch_md5(http)
     asset_base = body.get("title", "print").replace(" ", "_")
     lan = channel == "cloud_lan"
-    steps = _cloud_print_steps(recs, task, md5, lan)
-    driver = reconstruct_task_driver(body, md5, asset_base)
-    if lan:
-        driver["access_code"] = "1234abcd"
+    steps = _cloud_print_steps(http, task, md5, lan)
+    # Prefer the ABI-CAPTURED PrintParams (ground truth) over reconstruction.
+    if abi:
+        params = abi[0]["args"].get("params", {})
+        driver = driver_from_captured_params(params, lan)
+        driver_source = "abi-captured"
+    else:
+        driver = reconstruct_task_driver(body, md5, asset_base)
+        if lan:
+            driver["access_code"] = "1234abcd"
+        driver_source = "reconstructed"
     model = args.model if args and args.model and args.model != "unknown" else "h2s"
     defaults = {"printer_model": model, "channel": channel,
-                "flow": "start_print", "_driver": driver}
+                "flow": "start_print", "_driver": driver,
+                "_driver_source": driver_source}
     return steps, dict(CLOUD_PRINT_VARS), defaults
 
 
@@ -733,20 +793,38 @@ TOPIC_REQ_RE = re.compile(r"^device/([^/]+)/request$")
 
 
 def recognize_device_command(recs, args):
-    mq = [r for r in recs if r.get("_proto") == "mqtt"
-          and r.get("event") == "publish"
-          and TOPIC_REQ_RE.match(r.get("topic", ""))]
-    if not mq:
-        raise SystemExit("device_command: no MQTT publish to device/<serial>/request")
-    rec = mq[0]
-    dev = TOPIC_REQ_RE.match(rec["topic"]).group(1)
+    # Prefer the ABI-CAPTURED send_message_to_printer input (the logical command
+    # the host handed the plugin) over the MQTT wire publish (post-sign envelope).
+    abi = abi_records(recs, ("send_message_to_printer", "send_message"))
+    driver_source = "reconstructed"
+    if abi:
+        rec = abi[0]["args"]
+        dev = rec.get("dev_id", "090000000000000")
+        payload = json.loads(rec.get("json", "{}"))
+        driver_source = "abi-captured"
+    else:
+        mq = [r for r in recs if r.get("_proto") == "mqtt"
+              and r.get("event") == "publish"
+              and TOPIC_REQ_RE.match(r.get("topic", ""))]
+        if not mq:
+            raise SystemExit("device_command: no ABI send_message capture and no "
+                             "MQTT publish to device/<serial>/request")
+        rec = mq[0]
+        dev = TOPIC_REQ_RE.match(rec["topic"]).group(1)
+        payload = json.loads(rec["payload"])
     dev_a = serial_anon(dev)
-    payload = json.loads(rec["payload"])
-    signed = "header" in payload and "print" in payload
-    if signed:
+    signed = "print" in payload and payload.get("print", {}).get("command") not in (None,)
+    # a genuine signed wire envelope carries a top-level "header"; strip it for
+    # the logical command (the harness re-signs from the print body).
+    if "header" in payload and "print" in payload:
         logical = {"print": payload["print"]}
+        signed = True
+    elif "print" in payload:
+        logical = {"print": payload["print"]}
+        signed = True
     else:
         logical = payload
+        signed = False
     # the command name lives one level down (system/print/pushing/... .command)
     command = ""
     for sub in payload.values():
@@ -756,7 +834,7 @@ def recognize_device_command(recs, args):
     payload_json = anon(logical)
     meta = base_meta(args, flow="device_command", channel="cloud_lan",
                      model=args.model if args.model != "unknown" else "h2d",
-                     extra={"command": command})
+                     extra={"command": command, "driver_source": driver_source})
     return {
         "schema": "obn-wire-flow/v1", "meta": meta,
         "driver": {"dev_id": dev_a, "access_code": "1234abcd",
@@ -1005,6 +1083,8 @@ def build_http_fixture(recs, args, steps, vars_, defaults):
     }
     if defaults.get("_driver") is not None:
         fixture["driver"] = defaults["_driver"]
+    if defaults.get("_driver_source"):
+        meta["driver_source"] = defaults["_driver_source"]
     return fixture
 
 
