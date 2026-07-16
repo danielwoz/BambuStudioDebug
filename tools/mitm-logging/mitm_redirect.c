@@ -33,11 +33,13 @@
  * The LAN :8883 rule (REDIRECT_8883, printer IP) is unchanged and separate.
  *
  * The plugin's MQTT TLS uses a statically-linked OpenSSL that verifies against
- * the hardcoded CApath /etc/ssl/certs/ and ignores SSL_CERT_DIR/FILE, so the
- * SSL_set_verify override cannot make it accept the relay cert. Instead, when
- * MITM_CA_DIR is set, file opens under /etc/ssl/certs/ are redirected to that
- * user-owned CA directory (system roots + the relay's MITM CA); see the
- * ca_rewrite hooks below. No system trust store or root access is needed.
+ * its compiled-in CApath/CAINFO (the build tree's ".../usr/local/certs/" dirs +
+ * the /etc/ssl/certs bundle), ignoring SSL_CERT_DIR/FILE and the system trust
+ * store, so the SSL_set_verify override cannot make it accept the relay cert.
+ * Instead, when MITM_CA_DIR is set, reads of CA-store files (hashed <hash>.N
+ * certs / ca-certificates.crt) under any ".../certs/" or /etc/ssl/certs dir are
+ * redirected to that user-owned CA directory (system roots + the relay's MITM
+ * CA); see the ca_rewrite hooks below. No system trust store or root needed.
  *
  * Build: tools/mitm-logging/build_redirect.sh
  */
@@ -53,6 +55,7 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 
@@ -167,17 +170,28 @@ void SSL_set_verify(SSL *s, int m, SSL_verify_cb cb) {
 /* CA-path redirect for the cloud MQTT relay leg.
  *
  * The genuine plugin's MQTT/cloud TLS uses a statically-linked OpenSSL that
- * verifies the broker cert against the hardcoded CApath "/etc/ssl/certs/",
- * ignoring SSL_CERT_DIR/SSL_CERT_FILE. The LD_PRELOAD SSL_set_verify override
- * above cannot reach that static copy, so the relay's own cert would be
- * rejected (TLSV1_ALERT_UNKNOWN_CA). Rather than modify the system trust store
- * (root), we transparently redirect reads of the CA directory to a
- * user-owned copy that also holds the relay's MITM CA: when MITM_CA_DIR is set,
- * any path under "/etc/ssl/certs/" is rewritten to "$MITM_CA_DIR/". That dir is
- * a superset of the system roots (built from /etc/ssl/certs) plus the relay CA,
- * so real-host verification is unchanged and only the relay's leg newly
- * validates. Scoped to file opens of that one directory; nothing else moves. */
-#define CA_PREFIX "/etc/ssl/certs/"
+ * verifies the broker cert against its *compiled-in* CApath and CAINFO bundle,
+ * ignoring SSL_CERT_DIR/SSL_CERT_FILE and the system trust store. On the
+ * capture host those baked paths are the plugin's and Studio's OpenSSL build
+ * trees, e.g. "/home/<builder>/.../usr/local/certs/" and
+ * ".../deps/build/destdir/usr/local/certs/", plus the "/etc/ssl/certs/" bundle;
+ * OpenSSL does hashed <subject-hash>.N lookups inside those dirs. The
+ * SSL_set_verify override above cannot reach the static copy, so the relay cert
+ * would be rejected (TLSV1_ALERT_UNKNOWN_CA). Rather than touch the system
+ * trust store (root), we transparently redirect the plugin's CA-file reads to a
+ * user-owned dir that also holds the relay's MITM CA: when MITM_CA_DIR is set,
+ * a read of a CA store entry (a "<8hex>.N" hashed cert, or "ca-certificates.crt")
+ * under any ".../certs/" or "/etc/ssl/certs/" directory is remapped to
+ * "$MITM_CA_DIR/<basename>". That dir is a superset of the system roots plus the
+ * relay CA, so real-host verification is unchanged and the relay leg newly
+ * validates. Scoped to CA-store files only (openssl.cnf etc. pass through).
+ *
+ * NOTE: this makes Studio's own OpenSSL trust the relay CA, but does NOT defeat
+ * the genuine Bambu plugin's CLOUD MQTT leg: that channel is certificate-pinned
+ * (BambuSource carries an embedded CA, no plaintext cert in the binary) and
+ * never consults any on-disk CA store, so it rejects the relay leaf regardless
+ * (see docs/MITM_LOGGING.md). The redirect remains useful for static-OpenSSL
+ * plugins whose CA store is an on-disk file rather than pinned. */
 
 static void ca_debug(const char *fn, const char *path) {
   const char *dbg = getenv("MITM_CA_DEBUG");
@@ -191,15 +205,61 @@ static void ca_debug(const char *fn, const char *path) {
   if (f) { fprintf(f, "%s\t%s\n", fn, path); fclose(f); }
 }
 
+/* basename is an OpenSSL CA-store entry: a "<8+ hex>.<digits>" hashed cert
+ * (CApath), the ca-certificates bundle, or the default CAINFO bundle
+ * "cert.pem" (OPENSSLDIR/cert.pem, what the plugin's OpenSSL loads whole). */
+static int is_ca_store_file(const char *base) {
+  if (strcmp(base, "ca-certificates.crt") == 0) return 1;
+  if (strcmp(base, "cert.pem") == 0) return 1;
+  const char *dot = strrchr(base, '.');
+  if (!dot || dot == base) return 0;
+  for (const char *p = base; p < dot; p++)
+    if (!( (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') ||
+           (*p >= 'A' && *p <= 'F') )) return 0;
+  if ((dot - base) < 4) return 0;           /* require a real hash, not "x.0" */
+  for (const char *p = dot + 1; *p; p++)
+    if (*p < '0' || *p > '9') return 0;      /* suffix is all digits */
+  return dot[1] != '\0';
+}
+
+/* True if the file sits in an OpenSSL CApath / bundle location: the system
+ * /etc/ssl tree, any ".../certs/" hashed dir, or an OpenSSLDIR ("/usr/local"
+ * or ".../ssl/") holding the cert.pem/ca bundle. */
+static int in_ca_dir(const char *path, const char *base) {
+  size_t plen = (size_t)(base - path);       /* dir part incl. trailing '/' */
+  if (strncmp(path, "/etc/ssl/", 9) == 0) return 1;
+  if (plen >= 7 && strncmp(base - 7, "/certs/", 7) == 0) return 1;
+  if (plen >= 5 && strncmp(base - 5, "/ssl/", 5) == 0) return 1;
+  if (strstr(path, "/usr/local/")) return 1;
+  return 0;
+}
+
+/* Redirect a CApath *directory* open (opendir enumeration) to MITM_CA_DIR. */
+static const char *ca_dir_rewrite(const char *path, char *buf, size_t bufsz) {
+  if (!path) return path;
+  const char *dir = getenv("MITM_CA_DIR");
+  if (!dir || !dir[0]) return path;
+  size_t n = strlen(path);
+  int is_certs = (n >= 6 && strcmp(path + n - 6, "/certs") == 0) ||
+                 (n >= 7 && strcmp(path + n - 7, "/certs/") == 0) ||
+                 strcmp(path, "/etc/ssl/certs") == 0;
+  if (!is_certs) return path;
+  ca_debug("REMAPDIR", dir);
+  return dir;
+}
+
 static const char *ca_rewrite(const char *path, char *buf, size_t bufsz) {
   if (!path) return path;
   ca_debug("open", path);
   const char *dir = getenv("MITM_CA_DIR");
   if (!dir || !dir[0]) return path;
-  size_t pl = strlen(CA_PREFIX);
-  if (strncmp(path, CA_PREFIX, pl) != 0) return path;
-  int n = snprintf(buf, bufsz, "%s/%s", dir, path + pl);
+  const char *base = strrchr(path, '/');
+  if (!base) return path;
+  base += 1;
+  if (!in_ca_dir(path, base) || !is_ca_store_file(base)) return path;
+  int n = snprintf(buf, bufsz, "%s/%s", dir, base);
   if (n <= 0 || (size_t)n >= bufsz) return path;
+  ca_debug("REMAP", buf);
   return buf;
 }
 
@@ -292,4 +352,13 @@ int access(const char *path, int amode) {
   if (!r) r = (int (*)(const char *, int))dlsym(RTLD_NEXT, "access");
   char buf[4096];
   return r(ca_rewrite(path, buf, sizeof buf), amode);
+}
+
+/* OpenSSL's by_dir CApath may enumerate the directory; redirect the whole
+ * CApath dir to MITM_CA_DIR so the relay CA is among the entries. */
+DIR *opendir(const char *path) {
+  static DIR *(*r)(const char *);
+  if (!r) r = (DIR *(*)(const char *))dlsym(RTLD_NEXT, "opendir");
+  char buf[4096];
+  return r(ca_dir_rewrite(path, buf, sizeof buf));
 }

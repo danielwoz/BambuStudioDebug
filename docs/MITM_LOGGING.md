@@ -99,29 +99,43 @@ the print-command topics, pass the plugin's paired cert with
 `--upstream-cert/--upstream-key` (BBL_MTLS_CERT/KEY) and the relay presents it on
 the upstream leg only.
 
-**Trust — the cloud wrinkle.** Unlike the REST leg, the plugin's MQTT/cloud TLS
-is a **statically-linked OpenSSL** (BambuSource, OpenSSL 3.1.4) that verifies the
-broker cert against the hardcoded CApath `/etc/ssl/certs/` and loads that trust
-store *outside* interposable libc file calls. Consequences, all observed:
+**Trust — the cloud channel is certificate-pinned.** Unlike the REST leg, the
+plugin's cloud MQTT TLS (BambuSource, a statically-linked OpenSSL 3.1.4) verifies
+the broker cert against a **CA it carries itself**, not the system trust store or
+any file the process can be pointed at. This was established exhaustively — every
+one of these was tried and the relay leaf was still rejected with
+`TLSV1_ALERT_UNKNOWN_CA`, and the relay CA's subject hash was **never** looked
+up by the MQTT leg:
 
-- `SSL_set_verify → VERIFY_NONE` cannot reach it (the symbol is internal to the
-  static copy), so a self-signed relay cert is rejected with
-  `TLSV1_ALERT_UNKNOWN_CA`.
-- `SSL_CERT_FILE` / `SSL_CERT_DIR` are ignored (the CApath is hardcoded).
-- The shim additionally offers a `MITM_CA_DIR` path-substitution (open/openat/
-  fopen/stat/`__xstat` hooks rewrite `/etc/ssl/certs/` → a user CA dir = system
-  roots + the relay CA). This works for anything that reads the store through
-  libc — verified with the `openssl` CLI and Studio's *own* REST OpenSSL — but
-  the plugin's MQTT store load bypasses those hooks (the relay CA hash is never
-  looked up), so it still rejects the relay cert.
+- `SSL_set_verify → VERIFY_NONE` (LD_PRELOAD): can't reach the static OpenSSL.
+- `SSL_CERT_FILE` / `SSL_CERT_DIR`: ignored.
+- Relay CA installed in the **system store** (`/etc/ssl/certs`, root — both the
+  hashed `<hash>.0` symlink and the regenerated `ca-certificates.crt` bundle):
+  rejected. BambuSource does not consult the system store.
+- The shim's `MITM_CA_DIR` redirect of every CA-store read — hashed `<hash>.N`,
+  `cert.pem`, `ca-certificates.crt` — under `/etc/ssl/`, any `.../certs/`, and
+  the plugin's compiled OpenSSLDIR (`/home/<builder>/…/usr/local/…`), across the
+  `open`/`openat`/`fopen`/`stat`/`__xstat`/`opendir` families **and** raw
+  `syscall()`: verified to redirect Studio's *own* REST OpenSSL (its real-CA
+  hash lookups remap to the user dir), yet the MQTT leg never reads the relay CA
+  through any of them.
 
-The only remaining lever is to add the relay CA to the real system trust store
-(`/etc/ssl/certs`, root) — the standard MITM-CA install, exactly analogous to
-installing the mitmproxy CA. Everything up to that boundary is verified: the
-transport redirect (the plugin connects to the relay), the relay's
-TLS-terminate + bidirectional parse + byte-exact forward, the relay's upstream
-TLS to the real broker (TLS 1.3), and the importer → harness path. With the CA
-installed in the system store the same relay captures the live session unchanged.
+`strings` finds **no plaintext CA** in BambuSource (0 DER cert blocks), so the
+pinned CA is embedded/obfuscated inside the VMProtected library and loaded in
+memory. Confirming test: launched **without** the MQTT redirect, the plugin
+connects to the real broker with no error — its pinned CA trusts the genuine
+broker — so the sole MITM blocker is that the relay leaf is not signed by that
+pinned CA. Capturing the plugin's own cloud MQTT session therefore isn't possible
+by TLS interception; it would require patching the pinned CA inside the plugin
+binary (out of scope) or a relay cert chaining to the pinned root (unavailable).
+
+Everything up to that pinning boundary is verified and works: the transport
+redirect (the plugin's `us.mqtt.bambulab.com` connection lands on the relay), the
+relay's TLS-terminate + bidirectional parse + byte-exact forward + keepalive, the
+relay's upstream TLS 1.3 to the real broker, and the importer → harness path
+(loopback + `ledctrl`/`project_file` fixtures). The `MITM_CA_DIR` redirect
+remains useful for other statically-linked-OpenSSL plugins that read their CA
+store from the filesystem (not pinned).
 
 ---
 
@@ -350,7 +364,7 @@ All five protocols verified on Linux; each generated fixture is accepted by
 | Composite `lan_print` (pure LAN) | genuine FTPS `STOR` + replay MQTT | **structural only** — no harness `lan` driver yet (see below) |
 | SSDP `ssdp_discovery` (a1 + h2s) | **live** real printer NOTIFY broadcasts on `:2021` | parse + live UDP listener pass |
 | MQTT `device_command` (LAN) | **live** relay to a real printer `:8883` (CONNACK + PUBACK from the printer) | `MqttBrokerMock` matches |
-| cloud MQTT `device_command` | shim redirect reaches the relay live (plugin `us.mqtt.bambulab.com` connection lands on `:9883`); relay TLS-terminate + bidirectional parse + forward + real-broker upstream TLS 1.3 proven by loopback; importer `ledctrl`/`project_file` fixtures pass | `MqttBrokerMock` matches; **plugin-side TLS trust needs the relay CA in the system store (root)** |
+| cloud MQTT `device_command` | shim redirect reaches the relay live (plugin `us.mqtt.bambulab.com` connection lands on `:9883`); relay TLS-terminate + bidirectional parse + forward + real-broker upstream TLS 1.3 proven by loopback; importer `ledctrl`/`project_file` fixtures pass | `MqttBrokerMock` matches; **the plugin's cloud MQTT is certificate-pinned (embedded CA in VMProtected BambuSource) — the live session cannot be TLS-MITM'd; system-store install + full CA-file redirect both rejected** |
 | FTPS `storage_list` | **live** relay to a real printer `:990` (real directory LIST, TLS session reuse) | `FtpsMock` parses all files |
 | CTRL `ctrl_storage_list` | **live** `:6000` LOGIN handshake against a real printer + full harness `NativeTunnelMock`+`FtpsMock` run | handshake accepted; harness passes |
 

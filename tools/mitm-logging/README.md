@@ -62,15 +62,24 @@ LD_PRELOAD=./mitm_redirect.so REDIRECT_443=9443 REDIRECT_MQTT8883=9883 \
 The CONNECT auth is **username/password** (numeric cloud uid + access token),
 forwarded raw to the broker; the relay logs only the auth *shape* (token
 redacted). `MITM_CA_DIR` is a user-owned CA directory (system roots + the relay
-CA) that the shim substitutes for `/etc/ssl/certs/` reads.
+CA) that the shim substitutes for the plugin's CA-store file reads.
 
-**Trust caveat.** The genuine plugin's MQTT TLS uses a statically-linked OpenSSL
-whose CA trust is loaded outside libc file calls, so neither `SSL_set_verify`
-nor the `MITM_CA_DIR` path-substitution reaches it — the relay cert is rejected
-(`unknown ca`) unless the relay CA is added to the real system store
-(`/etc/ssl/certs`, root). The transport redirect, relay TLS-terminate + parse +
-bidirectional forward, upstream-broker TLS, and the importer path are all
-verified independently; the plugin-side trust install is the one root step.
+**Trust caveat — the cloud MQTT channel is certificate-pinned.** The genuine
+plugin's cloud MQTT TLS (statically-linked OpenSSL in the VMProtected
+BambuSource) verifies the broker against a CA it carries itself. Every external
+trust mechanism was tried and rejected: `SSL_set_verify`, `SSL_CERT_FILE/DIR`,
+the relay CA in the **system store** (root, hashed + bundle), and the shim's full
+`MITM_CA_DIR` redirect of all CA-store reads (`<hash>.N`/`cert.pem`/
+`ca-certificates.crt` across the open/stat/opendir families and raw `syscall()`)
+— the relay CA is never even looked up. No plaintext CA exists in BambuSource, so
+the pinned CA is embedded/obfuscated in the binary. Launched without the redirect
+the plugin connects to the real broker fine, so the sole blocker is the pinned
+CA. **The plugin's own cloud MQTT session therefore cannot be TLS-MITM'd**
+without patching the plugin binary. The transport redirect, relay TLS-terminate
++ bidirectional parse/forward + keepalive, upstream-broker TLS 1.3, and the
+importer path are all verified independently (loopback + fixtures). The
+`MITM_CA_DIR` redirect stays useful for other static-OpenSSL plugins whose CA
+store is an on-disk file (not pinned).
 
 ## Security
 
