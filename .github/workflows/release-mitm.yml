@@ -1,0 +1,115 @@
+name: Release MITM tools (Linux)
+
+# Packages the standalone MITM wire-capture tooling for a BambuStudio release and
+# publishes it as a GitHub (pre)release. LIGHT track: tools only -- it does NOT
+# build BambuStudio itself. The tools wrap the user's own BambuStudio <ver>
+# binary at capture time. Linux-only (the OBN wire-compliance harness the fixtures
+# feed does not support Windows/macOS yet).
+#
+# Triggered by pushing a debug-<ver> tag (e.g. debug-02.07.00.55). The release is
+# marked as a PRERELEASE on purpose: the default branch carries winget / homebrew
+# workflows that fire on `release: released`; a prerelease fires `prereleased`
+# instead, so those are not triggered by these tooling releases.
+
+on:
+  push:
+    tags:
+      - 'debug-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'BambuStudio version (e.g. 02.07.00.55)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+            TAG="debug-${VER}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#debug-}"
+          fi
+          echo "ver=$VER"  >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"  >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y gcc libssl-dev
+
+      - name: Build the redirect shim
+        run: bash tools/mitm-logging/build_redirect.sh tools/mitm-logging/mitm_redirect.so
+
+      - name: Stage the package
+        id: pkg
+        run: |
+          VER="${{ steps.ver.outputs.ver }}"
+          NAME="bambustudiodebug-mitm-tools-${VER}-linux"
+          mkdir -p "dist/${NAME}/tools"
+          cp -r tools/mitm-logging "dist/${NAME}/tools/mitm-logging"
+          rm -rf "dist/${NAME}/tools/mitm-logging/__pycache__"
+          mkdir -p "dist/${NAME}/docs"
+          cp docs/MITM_LOGGING.md "dist/${NAME}/docs/MITM_LOGGING.md"
+          [ -f docs/RELEASES.md ] && cp docs/RELEASES.md "dist/${NAME}/docs/RELEASES.md" || true
+          cat > "dist/${NAME}/USAGE.txt" <<EOF
+          BambuStudioDebug MITM capture tooling for BambuStudio ${VER} (Linux only)
+          =========================================================================
+
+          This bundle is the transport-level MITM capture tooling that records what
+          the GENUINE closed-source Bambu network plugin puts on the wire, and turns
+          it into open-bamboo-networking (OBN) wire-flow fixtures. It does NOT contain
+          BambuStudio -- use it to wrap your OWN BambuStudio ${VER} build.
+
+          Requirements: Linux, python3, mitmproxy (pip install mitmproxy), and the
+          genuine libbambu_networking.so installed as BambuStudio's network plugin.
+
+          Quick start:
+            1. HTTPS:  tools/mitm-logging/capture.sh --studio /path/to/bambu-studio
+                       (log in, reproduce the issue, quit)
+            2. SSDP:   python3 tools/mitm-logging/ssdp_sniff.py --seconds 20 --out ssdp.jsonl
+            3. Import: python3 tools/mitm-logging/import_flow.py <log> --flow <flow> -o flow.json
+            4. Drop flow.json into the OBN tree:
+                 tests/wire-fixtures/linux/<network_plugin_version>/<channel>/<model>/<flow>/flow.json
+               and run the OBN wire_compliance_test / ctest to see where OBN diverges.
+
+          Full design + per-protocol recipes: docs/MITM_LOGGING.md
+          Prebuilt tools/mitm-logging/mitm_redirect.so is included; rebuild with
+          tools/mitm-logging/build_redirect.sh if your glibc/openssl differs.
+          EOF
+          tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "tarball=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          ls -l "dist/${NAME}.tar.gz"
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${{ steps.ver.outputs.ver }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          TARBALL="${{ steps.pkg.outputs.tarball }}"
+          NOTES="Linux MITM wire-capture tooling for BambuStudio ${VER}.
+
+          Tools only (no BambuStudio binary). Wrap your own BambuStudio ${VER} to
+          record the genuine network plugin's traffic and generate OBN wire-flow
+          fixtures. Linux-only: the OBN wire-compliance harness does not support
+          Windows/macOS yet. See docs/MITM_LOGGING.md in the tarball."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$TARBALL" --clobber
+          else
+            gh release create "$TAG" "$TARBALL" \
+              --prerelease \
+              --title "BambuStudioDebug MITM tools — $VER (Linux)" \
+              --notes "$NOTES"
+          fi
