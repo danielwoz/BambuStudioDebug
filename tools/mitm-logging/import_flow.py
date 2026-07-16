@@ -395,10 +395,14 @@ def recognize_preset_write(recs, args=None):
 
 
 def _rep_flags(recs, method, sub):
-    """Header flags from a representative record for method+path-substring."""
+    """Header flags from a representative record for method+path-substring. The
+    fallback (abi-only capture) mirrors the genuine plugin: GETs carry no body,
+    so no Content-Type; body methods (POST/PUT/PATCH) do."""
     _, r = find_rec(recs, method, lambda p: sub in p)
-    return flags_from(r) if r else {"block": True, "client_id": True,
-                                    "content_type": True, "authorization": True}
+    if r:
+        return flags_from(r)
+    return {"block": True, "client_id": True,
+            "content_type": method != "GET", "authorization": True}
 
 
 def abi_records(recs, fns):
@@ -412,16 +416,14 @@ def driver_from_captured_params(params, lan):
     ground truth, no inversion. Fields map 1:1 to params_from_driver."""
     import os as _os
 
-    def asset(path, suffix):
-        base = _os.path.basename(path or "")
-        if not base:
-            return "assets/print%s" % suffix
-        # strip a trailing .gcode.3mf / .3mf so we can re-add the wanted suffix
-        for ext in (".gcode.3mf", ".3mf"):
-            if base.endswith(ext):
-                base = base[: -len(ext)]
-                break
-        return "assets/%s%s" % (base, suffix)
+    # The config 3mf on the wire is a per-slice temp with an opaque name; both
+    # the sliced 3mf and its config are named after the model in the fixture, so
+    # derive both from the MAIN filename's base.
+    base = _os.path.basename(params.get("filename") or "") or "print.gcode.3mf"
+    for ext in (".gcode.3mf", ".3mf"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
 
     d = {
         "project_name": params.get("project_name") or params.get("task_name", ""),
@@ -443,8 +445,8 @@ def driver_from_captured_params(params, lan):
         "ams_mapping2": params.get("ams_mapping2", ""),
         "ams_mapping_info": params.get("ams_mapping_info", ""),
         "nozzles_info": params.get("nozzles_info", ""),
-        "asset": asset(params.get("filename"), ".gcode.3mf"),
-        "config_asset": asset(params.get("config_filename"), "_config.3mf"),
+        "asset": "assets/%s.gcode.3mf" % base,
+        "config_asset": "assets/%s_config.3mf" % base,
     }
     if lan:
         d["access_code"] = "1234abcd"   # password is redacted in the tap log
@@ -481,6 +483,56 @@ def reconstruct_task_driver(body, md5, asset_base):
         "asset": "assets/%s.gcode.3mf" % asset_base,
         "config_asset": "assets/%s_config.3mf" % asset_base,
     }
+
+
+def driver_to_task_body(driver, lan):
+    """Build a create_task body from the driver, mirroring build_task_body, so an
+    abi-captured print (no HTTP capture) can still emit the body_builder step."""
+    def loads(s, default):
+        try:
+            return json.loads(s) if s else default
+        except (ValueError, TypeError):
+            return default
+    ams2 = [{"amsId": e.get("ams_id", 255), "slotId": e.get("slot_id", 0)}
+            for e in loads(driver.get("ams_mapping2"), [])]
+    return {
+        "amsDetailMapping": loads(driver.get("ams_mapping_info"), []),
+        "amsMapping": loads(driver.get("ams_mapping"), []),
+        "amsMapping2": ams2,
+        "autoBedLeveling": driver.get("auto_bed_leveling", 2),
+        "bedLeveling": driver.get("task_bed_leveling", False),
+        "bedType": driver.get("task_bed_type", "auto"),
+        "cfg": "0", "cover": "",
+        "deviceId": driver.get("dev_id", "090000000000000"),
+        "extrudeCaliFlag": driver.get("auto_flow_cali", 2),
+        "extrudeCaliManualMode": driver.get("extruder_cali_manual_mode", 0),
+        "filamentSettingIds": [],
+        "flowCali": driver.get("task_flow_cali", False),
+        "layerInspect": driver.get("task_layer_inspect", False),
+        "mode": "lan_file" if lan else "cloud_file",
+        "modelId": "{{model_id}}", "nozzleInfos": loads(driver.get("nozzles_info"), []),
+        "nozzleOffsetCali": driver.get("auto_offset_cali", 2),
+        "oriModelId": "", "oriProfileId": 0,
+        "plateIndex": driver.get("plate_index", 1),
+        "profileId": "{{profile_id}}", "sequence_id": "{{seq}}",
+        "timelapse": driver.get("task_record_timelapse", False),
+        "title": driver.get("project_name", "print"),
+        "useAms": driver.get("task_use_ams", False),
+        "vibrationCali": driver.get("task_vibration_cali", False),
+    }
+
+
+def _synth_task_rec(body):
+    """A synthetic POST /my/task record (canonical identity headers) so the
+    HTTP-oriented step builder works from an abi-only capture."""
+    hdrs = [["Host", "api.bambulab.com"],
+            ["User-Agent", "bambu_network_agent/02.07.00.50"],
+            ["X-BBL-Client-ID", "<dynamic>"], ["X-BBL-Device-ID", "<dynamic>"],
+            ["Authorization", "Bearer <tok>"], ["Content-Type", "application/json"]]
+    return {"_proto": "http", "method": "POST",
+            "path": "/v1/user-service/my/task",
+            "query": "/v1/user-service/my/task",
+            "body": json.dumps(body), "headers": hdrs}
 
 
 def _task_step_body(body):
@@ -546,7 +598,10 @@ def _cloud_print_steps(recs, task_rec, patch_md5, lan):
         {"seq": 6, "id": "get_my_setting", "protocol": "http", "channel_only": "cloud_lan",
          "request": {"method": "GET", "host": "api.bambulab.com",
                      "path": "/v1/user-service/my/setting",
-                     "headers": _rep_flags(recs, "GET", "/user-service/my/setting")},
+                     # genuine plugin sends Content-Type on this GET (unlike the polls)
+                     "headers": (find_rec(recs, "GET", lambda p: "/user-service/my/setting" in p)[1]
+                                 and flags_from(find_rec(recs, "GET", lambda p: "/user-service/my/setting" in p)[1]))
+                                or {"block": True, "client_id": True, "content_type": True, "authorization": True}},
          "expect": {"status": 200}},
         {"seq": 7, "id": "get_upload_url", "protocol": "http",
          "request": {"method": "GET", "host": "api.bambulab.com",
@@ -639,20 +694,32 @@ def recognize_cloud_print(recs, args=None):
     mode = "lan_file" if channel == "cloud_lan" else "cloud_file"
     dev = getattr(args, "dev", None) if args else None
     title = getattr(args, "print_title", None) if args else None
+    lan = channel == "cloud_lan"
     _, task = _find_create_task(http, mode, dev, title)
+    # ABI-only capture (tap PrintParams, no HTTP): synthesize the create_task
+    # record from the captured driver so the pipeline + body_builder still emit.
+    if not task and abi:
+        params = abi[0]["args"].get("params", {})
+        driver = driver_from_captured_params(params, lan)
+        if lan:
+            driver.setdefault("access_code", "1234abcd")
+        task = _synth_task_rec(driver_to_task_body(driver, lan))
+        http = [task]
     if not task:
-        raise SystemExit(f"cloud_print: no POST /my/task with mode={mode}"
+        raise SystemExit(f"cloud_print: no POST /my/task with mode={mode} and no "
+                         f"abi start_local_print capture"
                          + (f" dev={dev}" if dev else "")
                          + (f" title={title}" if title else ""))
     body = json.loads(task["body"])
     md5 = _patch_md5(http)
     asset_base = body.get("title", "print").replace(" ", "_")
-    lan = channel == "cloud_lan"
     steps = _cloud_print_steps(http, task, md5, lan)
     # Prefer the ABI-CAPTURED PrintParams (ground truth) over reconstruction.
     if abi:
         params = abi[0]["args"].get("params", {})
         driver = driver_from_captured_params(params, lan)
+        if lan:
+            driver.setdefault("access_code", "1234abcd")
         driver_source = "abi-captured"
     else:
         driver = reconstruct_task_driver(body, md5, asset_base)
@@ -1051,11 +1118,45 @@ def load_log(path):
     return recs
 
 
+CANON_IDENTITY = {
+    "order": ["Host", "User-Agent", "X-BBL-Client-ID", "X-BBL-Client-Name",
+              "X-BBL-Client-Type", "X-BBL-Client-Version", "X-BBL-Device-ID",
+              "X-BBL-Language", "X-BBL-OS-Type", "X-BBL-OS-Version",
+              "X-BBL-Agent-Version", "X-BBL-Executable-info", "X-BBL-Agent-OS-Type",
+              "X-BBL-Executable-Env", "accept", "Authorization", "Content-Type"],
+    "values": {"Host": "api.bambulab.com",
+               "User-Agent": "bambu_network_agent/02.07.00.50",
+               "X-BBL-Client-ID": "<dynamic:slicer:{user_id}:{hex4}>",
+               "X-BBL-Client-Name": "BambuStudio", "X-BBL-Client-Type": "slicer",
+               "X-BBL-Client-Version": "02.07.00.55",
+               "X-BBL-Device-ID": "<dynamic:install-uuid>", "X-BBL-Language": "en-US",
+               "X-BBL-OS-Type": "linux", "X-BBL-OS-Version": "5.15.0",
+               "X-BBL-Agent-Version": "02.07.00.50", "X-BBL-Executable-info": "{}",
+               "X-BBL-Agent-OS-Type": "linux", "X-BBL-Executable-Env": "false",
+               "accept": "application/json",
+               "Authorization": "<dynamic:Bearer access_token>",
+               "Content-Type": "application/json"}}
+
+
 def build_http_fixture(recs, args, steps, vars_, defaults):
     if args.model is None:
         args.model = defaults.get("printer_model", "unknown")
     if args.channel is None:
         args.channel = defaults.get("channel", "unknown")
+    if not recs:
+        # abi-only capture (no HTTP): canonical identity block + meta.
+        meta = {"os": args.os or "linux",
+                "network_plugin_version": args.net_ver or "02.07.00.50",
+                "slicer_client_version": args.client_ver or "02.07.00.55",
+                "channel": args.channel, "printer_model": args.model,
+                "flow": defaults.get("flow", args.flow), "source": "BambuStudio"}
+        if defaults.get("_driver_source"):
+            meta["driver_source"] = defaults["_driver_source"]
+        fx = {"schema": "obn-wire-flow/v1", "meta": meta,
+              "identity_block": CANON_IDENTITY, "vars": vars_, "steps": steps}
+        if defaults.get("_driver") is not None:
+            fx["driver"] = defaults["_driver"]
+        return fx
     ref = next((r for r in recs if has_header(r, "x-bbl-client-version")), recs[0])
     ua = get_header(ref, "user-agent") or ""
     m = re.search(r"bambu_network_agent/(\S+)", ua)
@@ -1153,7 +1254,9 @@ def main():
         nsteps = len(fixture["steps"])
     else:
         http = [r for r in recs if r.get("_proto") == "http"]
-        if not http:
+        abi_print = any(r.get("_proto") == "abi" and r.get("fn", "").startswith("start")
+                        for r in recs)
+        if not http and not (args.flow in ("cloud_print", "hybrid_print") and abi_print):
             raise SystemExit(f"flow '{args.flow}' needs HTTP records; none in log")
         if args.flow in HTTP_RECOGNIZERS:
             steps, vars_, defaults = HTTP_RECOGNIZERS[args.flow](recs, args)

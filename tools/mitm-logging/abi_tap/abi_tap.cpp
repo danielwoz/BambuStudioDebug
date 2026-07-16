@@ -277,3 +277,37 @@ extern "C" void* dlsym(void* handle, const char* name) {
 
     return real;   // untapped symbols pass straight through
 }
+
+// ---------------------------------------------------------------------------
+// Optional LAN transport redirect (same lib, so no inter-preload dlsym clash).
+// When LAN_IP + REDIRECT_990/REDIRECT_8883 are set, steer that printer's FTPS
+// (:990) / MQTT (:8883) connections to local relays (forward + log). Scoped to
+// LAN_IP so the cloud broker connections are untouched. Not linked against a
+// second OpenSSL (that hangs BambuStudio's static-OpenSSL startup) -- this is
+// connect()-only. This is what lets a full GUI print capture record the FTPS
+// STOR + MQTT project_file alongside the tap's PrintParams.
+// ---------------------------------------------------------------------------
+#include <netinet/in.h>
+#include <arpa/inet.h>
+extern "C" int connect(int fd, const struct sockaddr* a, socklen_t l) {
+    static int (*rc)(int, const struct sockaddr*, socklen_t) = nullptr;
+    if (!rc) rc = (int (*)(int, const struct sockaddr*, socklen_t))dlsym(RTLD_NEXT, "connect");
+    if (a && a->sa_family == AF_INET) {
+        const struct sockaddr_in* s = (const struct sockaddr_in*)a;
+        unsigned short p = ntohs(s->sin_port);
+        const char* lanip = getenv("LAN_IP");
+        char ipbuf[64] = {0};
+        inet_ntop(AF_INET, &s->sin_addr, ipbuf, sizeof ipbuf);
+        bool match = lanip && lanip[0] && std::strcmp(ipbuf, lanip) == 0;
+        const char* rd = (match && p == 990) ? getenv("REDIRECT_990")
+                       : (match && p == 8883) ? getenv("REDIRECT_8883") : nullptr;
+        if (rd && rd[0]) {
+            struct sockaddr_in b;
+            std::memcpy(&b, s, sizeof b);
+            b.sin_addr.s_addr = htonl(0x7f000001u);
+            b.sin_port = htons((unsigned short)atoi(rd));
+            return rc(fd, (const struct sockaddr*)&b, l);
+        }
+    }
+    return rc(fd, a, l);
+}

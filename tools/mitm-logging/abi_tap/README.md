@@ -99,7 +99,31 @@ Studio must load the *genuine* plugin, which its gate only accepts when
 must match the Studio version (local genuine plugins: `02.07.00.50`,
 `02.07.01.51`). A prebuilt Studio at a different version (e.g. `02.06.01.55`)
 shows *"Please install the network plugin"* and cannot LAN-print until a
-version-matched genuine plugin is installed/downloaded. With a matched Studio,
-add `abi_tap.so` to `LD_PRELOAD` next to `mitm_redirect.so`, run under Xvfb, drive
-the print, and (per printer safety) cancel during the pre-extrusion heating
-window or fire the stop kill-switch.
+version-matched genuine plugin is installed/downloaded.
+
+**Verified GUI capture (Studio 02.07.01.57 + genuine 02.07.01.51 plugin, real
+H2S).** With a version-matched Studio that loads the genuine plugin:
+
+1. Run under Xvfb (`Xvfb :99` + a WM like `openbox` so GTK sizes the window).
+2. `LD_PRELOAD=abi_tap.so` alone captures the ABI calls. **Do not add the full
+   `mitm_redirect.so`** to a static-OpenSSL Studio — its SSL_verify/getaddrinfo
+   hooks + second libssl hang Studio at `StaticPrintConfigs`. Instead the tap has
+   a **built-in LAN redirect** (`connect()` only, no OpenSSL): set
+   `LAN_IP=<printer_ip> REDIRECT_990=<ftps_relay_port> REDIRECT_8883=<mqtt_relay_port>`
+   to steer only that printer's FTPS/MQTT legs to `ftps_relay.py`/`mqtt_relay.py`
+   (the cloud broker is left alone, so a cloud-bound printer stays online).
+3. Load the model, click Print → the genuine plugin calls
+   `start_local_print_with_record`; the tap logs the real `PrintParams`.
+4. `import_flow.py <abi.jsonl> --flow hybrid_print --channel cloud_lan --model h2s`
+   → an `abi-captured` fixture (`meta.driver_source == "abi-captured"`) whose
+   driver is the ground-truth PrintParams. Supply the sliced 3mf under `assets/`;
+   the OBN harness (`drive_lan_start_print`) then passes.
+
+**Printer safety (mandatory).** A cold printer heats for minutes before any
+extrusion, so cancel well within that window. Test the kill-switch first
+(`obn_send_command … stop.json`). **Finding:** the obn signed `stop` was accepted
+at the MQTT layer (rc=0) but did **not** halt an already-accepted job on the H2S;
+Studio's own **GUI stop** (Device tab → Stop → confirm), which the genuine plugin
+authenticates, did halt it (state → FAILED, 0%, layer 0, no extrusion). Prefer
+the GUI stop for an active job; keep obn `stop` as a backup and verify the
+printer returns to idle after.
