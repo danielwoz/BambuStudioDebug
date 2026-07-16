@@ -74,6 +74,55 @@ unaffected. An equivalent alternative is to append the mitmproxy CA
 (`~/.mitmproxy/mitmproxy-ca-cert.pem`) to the plugin's CA bundle; disabling
 verification on the redirected leg is simpler and equally contained.
 
+### Cloud MQTT (long-lived device session)
+
+Cloud-connected printers are driven over a persistent MQTT 3.1.1 session to the
+region cloud broker (`us.mqtt.bambulab.com:8883`, region from the login/profile
+response). Device commands (`system` ledctrl/ams, RSA-signed `print` envelopes,
+and the cloud-delivered `project_file` that starts a print) publish to
+`device/<serial>/request`; status reports return on `device/<serial>/report`.
+
+The shim redirects it exactly like the REST leg but on a second sentinel: when
+`REDIRECT_MQTT8883` is set, `getaddrinfo` rewrites any `*.mqtt.bambulab.com`
+host to `127.0.0.3` and `connect()` steers that sentinel's `:8883` to
+`mqtt_cloud_relay.py`. The relay TLS-terminates, parses each packet **both
+directions** (commands and reports), and forwards every packet byte-exact —
+CONNECT/SUBSCRIBE/PUBLISH, the large report messages, and the PINGREQ/PINGRESP
+keepalive — so the session never drops.
+
+**Auth.** The cloud CONNECT authenticates the Bambu *account*:
+username = numeric cloud uid, password = access token. The plugin's own CONNECT
+is forwarded raw, so the broker authenticates exactly as if the plugin talked to
+it directly (no credential is reconstructed); the relay logs only the auth
+*shape* with the token redacted. If a firmware enforces client-cert **mTLS** on
+the print-command topics, pass the plugin's paired cert with
+`--upstream-cert/--upstream-key` (BBL_MTLS_CERT/KEY) and the relay presents it on
+the upstream leg only.
+
+**Trust — the cloud wrinkle.** Unlike the REST leg, the plugin's MQTT/cloud TLS
+is a **statically-linked OpenSSL** (BambuSource, OpenSSL 3.1.4) that verifies the
+broker cert against the hardcoded CApath `/etc/ssl/certs/` and loads that trust
+store *outside* interposable libc file calls. Consequences, all observed:
+
+- `SSL_set_verify → VERIFY_NONE` cannot reach it (the symbol is internal to the
+  static copy), so a self-signed relay cert is rejected with
+  `TLSV1_ALERT_UNKNOWN_CA`.
+- `SSL_CERT_FILE` / `SSL_CERT_DIR` are ignored (the CApath is hardcoded).
+- The shim additionally offers a `MITM_CA_DIR` path-substitution (open/openat/
+  fopen/stat/`__xstat` hooks rewrite `/etc/ssl/certs/` → a user CA dir = system
+  roots + the relay CA). This works for anything that reads the store through
+  libc — verified with the `openssl` CLI and Studio's *own* REST OpenSSL — but
+  the plugin's MQTT store load bypasses those hooks (the relay CA hash is never
+  looked up), so it still rejects the relay cert.
+
+The only remaining lever is to add the relay CA to the real system trust store
+(`/etc/ssl/certs`, root) — the standard MITM-CA install, exactly analogous to
+installing the mitmproxy CA. Everything up to that boundary is verified: the
+transport redirect (the plugin connects to the relay), the relay's
+TLS-terminate + bidirectional parse + byte-exact forward, the relay's upstream
+TLS to the real broker (TLS 1.3), and the importer → harness path. With the CA
+installed in the system store the same relay captures the live session unchanged.
+
 ---
 
 ## 2. Components (`tools/mitm-logging/`)
@@ -83,7 +132,8 @@ verification on the redirected leg is simpler and equally contained.
 | `mitm_redirect.c`, `build_redirect.sh` | LD_PRELOAD transport shim; steers `:443` (api.bambulab.com) and, when the paired `REDIRECT_8883/990/6000` env is set, the LAN transports to local relays. | all |
 | `wire_addon.py` | mitmdump addon; one NDJSON line per REST request. | HTTPS |
 | `ssdp_sniff.py` | passive UDP `:2021` sniffer for printer NOTIFY broadcasts (no TLS). | SSDP |
-| `mqtt_relay.py` | TLS-terminating MQTT 3.1.1 relay for `:8883` (LAN printer / cloud broker). | MQTT |
+| `mqtt_relay.py` | TLS-terminating MQTT 3.1.1 relay for `:8883` (LAN printer). | MQTT |
+| `mqtt_cloud_relay.py` | TLS-terminating relay for the region **cloud** broker `*.mqtt.bambulab.com:8883`; logs device commands + status reports both directions, introspects the CONNECT auth (uid/token, redacted), forwards the raw long-lived session. | cloud MQTT |
 | `ftps_relay.py` | implicit-FTPS relay for `:990` (control + PASV data, TLS session reuse). | FTPS |
 | `ctrl_relay.py` | native CTRL tunnel relay for `:6000` (16-byte framed handshake). | CTRL |
 | `capture.sh` | HTTPS orchestrator: build shim, start mitmdump, launch the slicer. | HTTPS |
@@ -161,10 +211,15 @@ harness's `body_builder`/`ftp_file_md5` path.
   the raw packet (Location IP, USN serial) while preserving header set/order/case
   (incl. the A1 uppercase-`HOST`/`:1900`/`DevSignal`/no-`NTS` variant), and emits
   the `driver.packet` + the `driver.expect` device-info the OSS parser must yield.
-- `device_command` (MQTT) — from a publish to `device/<serial>/request`; a
-  `system`/`pushing` command imports `signed:false` (verbatim), a `print`
-  envelope imports `signed:true` with `command_json={"print":…}` (the harness
-  re-signs RSA-SHA256 and cryptographically verifies).
+- `device_command` (MQTT, LAN or cloud) — from a publish to
+  `device/<serial>/request` (the topic is identical on the LAN and cloud
+  brokers, so a `mqtt_cloud_relay.py` capture imports through the same path); a
+  `system`/`pushing` command imports `signed:false` (verbatim, e.g. cloud
+  `ledctrl`), a `print` envelope (including the cloud-delivered `project_file`)
+  imports `signed:true` with `command_json={"print":…}` (the harness re-signs
+  RSA-SHA256 and cryptographically verifies). Anonymization additionally
+  redacts credential/signature query params in a cloud `project_file` url
+  (AWS/CloudFront presigned + Bambu `token`), keeping the url shape.
 - `storage_list` (FTPS) — from a captured `LIST`; emits `driver.listing` (raw)
   + `driver.expect_files` (all regular files, name+size).
 - `ctrl_storage_list` (CTRL) — same `listing` served over the FTPS bridge;
@@ -294,7 +349,8 @@ All five protocols verified on Linux; each generated fixture is accepted by
 | Composite `hybrid_print` (start_print, lan_file) | genuine HTTP + **live** FTPS `STOR` md5 + replay MQTT `project_file` | `drive_lan_start_print` OK (create_task lan_file + STOR md5 match + project_file ftp:// url) |
 | Composite `lan_print` (pure LAN) | genuine FTPS `STOR` + replay MQTT | **structural only** — no harness `lan` driver yet (see below) |
 | SSDP `ssdp_discovery` (a1 + h2s) | **live** real printer NOTIFY broadcasts on `:2021` | parse + live UDP listener pass |
-| MQTT `device_command` | **live** relay to a real printer `:8883` (CONNACK + PUBACK from the printer) | `MqttBrokerMock` matches |
+| MQTT `device_command` (LAN) | **live** relay to a real printer `:8883` (CONNACK + PUBACK from the printer) | `MqttBrokerMock` matches |
+| cloud MQTT `device_command` | shim redirect reaches the relay live (plugin `us.mqtt.bambulab.com` connection lands on `:9883`); relay TLS-terminate + bidirectional parse + forward + real-broker upstream TLS 1.3 proven by loopback; importer `ledctrl`/`project_file` fixtures pass | `MqttBrokerMock` matches; **plugin-side TLS trust needs the relay CA in the system store (root)** |
 | FTPS `storage_list` | **live** relay to a real printer `:990` (real directory LIST, TLS session reuse) | `FtpsMock` parses all files |
 | CTRL `ctrl_storage_list` | **live** `:6000` LOGIN handshake against a real printer + full harness `NativeTunnelMock`+`FtpsMock` run | handshake accepted; harness passes |
 

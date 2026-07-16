@@ -85,6 +85,29 @@ BEARER_RE = re.compile(r"Bearer\s+\S+", re.I)
 SERIAL_RE = re.compile(r"\b0[0-9A-Fa-f]{2}[0-9A-Za-z]{9,}\b")
 UID_KEYS = {"uid", "uidstr", "user_id", "userid"}
 
+# Query-string keys that carry a credential/signature in a cloud-delivered
+# project_file url (AWS/CloudFront presigned + Bambu token). Their VALUE is
+# redacted; the key and url shape are preserved so the fixture still documents
+# the request structure. Expires/timestamps are kept (not secret).
+URL_SECRET_KEYS = {
+    "signature", "sig", "x-amz-signature", "x-amz-credential",
+    "x-amz-security-token", "awsaccesskeyid", "credential", "token",
+    "access_token", "accesstoken", "key-pair-id", "policy", "password",
+    "apikey", "api_key",
+}
+_URL_QS_RE = re.compile(r"([?&])([^=&]+)=([^&#]*)")
+
+
+def redact_url_tokens(s):
+    if "://" not in s or "=" not in s:
+        return s
+    def repl(m):
+        sep, key, _val = m.group(1), m.group(2), m.group(3)
+        if key.lower() in URL_SECRET_KEYS:
+            return f"{sep}{key}=REDACTED"
+        return m.group(0)
+    return _URL_QS_RE.sub(repl, s)
+
 
 def anon_str(s):
     if not isinstance(s, str):
@@ -95,6 +118,7 @@ def anon_str(s):
     s = EMAIL_RE.sub("bob@test.com", s)
     s = IP_RE.sub("192.168.1.2", s)
     s = SERIAL_RE.sub(lambda m: m.group(0)[:3] + "0" * (len(m.group(0)) - 3), s)
+    s = redact_url_tokens(s)
     # 8-hex LAN access code appearing standalone
     if re.fullmatch(r"[0-9a-fA-F]{8}", s):
         s = "1234abcd"
