@@ -110,6 +110,25 @@ Field Sr(const char* k, const std::string& v) { return {k, scrub(v), true}; }
 Field I(const char* k, long long v) { return {k, std::to_string(v), false}; }
 Field B(const char* k, bool v) { return {k, v ? "true" : "false", false}; }
 
+// Emit an INBOUND report record. Same NDJSON schema as emit() plus a top-level
+// "dir":"report" so import_flow.py can tell plugin->Studio reports from the
+// outbound command records. dev_id + the report JSON are logged (scrubbed).
+void emit_report(const char* fn, const std::string& dev_id, const std::string& msg) {
+    FILE* f = logfp();
+    if (!f) return;
+    std::string line = "{\"proto\":\"abi\",\"dir\":\"report\",\"fn\":\"";
+    line += fn;
+    line += "\",\"ts\":";
+    line += std::to_string((long long)time(nullptr));
+    line += ",\"args\":{\"dev_id\":\"";
+    line += jesc(dev_id);
+    line += "\",\"msg\":\"";
+    line += jesc(scrub(msg));
+    line += "\"}}\n";
+    std::lock_guard<std::mutex> lk(g_mu);
+    fputs(line.c_str(), f);
+}
+
 // Serialize the whole PrintParams struct as one JSON object value.
 std::string pp_json(const PrintParams& p) {
     std::string o = "{";
@@ -182,6 +201,15 @@ int         (*r_start_print)(void*, PrintParams, OnUpdateStatusFn, WasCancelledF
 int         (*r_start_local_print_with_record)(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn) = nullptr;
 int         (*r_start_local_print)(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn) = nullptr;
 int         (*r_bind)(void*, std::string, std::string, std::string, std::string, bool, OnUpdateStatusFn) = nullptr;
+int         (*r_set_on_message_fn)(void*, OnMessageFn) = nullptr;
+int         (*r_set_on_local_message_fn)(void*, OnMessageFn) = nullptr;
+int         (*r_set_on_user_message_fn)(void*, OnMessageFn) = nullptr;
+
+// The host's REAL inbound callbacks, captured at registration; the tap wrappers
+// log the report then forward to these so Studio behaves normally.
+OnMessageFn g_real_on_message;
+OnMessageFn g_real_on_local_message;
+OnMessageFn g_real_on_user_message;
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -241,6 +269,42 @@ int w_bind(void* a, std::string dev_ip, std::string dev_id, std::string sec_link
     return r_bind(a, dev_ip, dev_id, sec_link, tz, improved, u);
 }
 
+// --- inbound report path ---------------------------------------------------
+// The plugin invokes these (from its MQTT thread) to hand a status report up to
+// Studio. Each logs the report, then forwards to the host's real callback so
+// Studio's device state / UI update exactly as normal.
+void tap_on_message(std::string dev_id, std::string msg) {
+    emit_report("on_message", dev_id, msg);
+    if (g_real_on_message) g_real_on_message(dev_id, msg);
+}
+void tap_on_local_message(std::string dev_id, std::string msg) {
+    emit_report("on_local_message", dev_id, msg);
+    if (g_real_on_local_message) g_real_on_local_message(dev_id, msg);
+}
+void tap_on_user_message(std::string dev_id, std::string msg) {
+    emit_report("on_user_message", dev_id, msg);
+    if (g_real_on_user_message) g_real_on_user_message(dev_id, msg);
+}
+
+// Setter wrappers: store the host's real callback, register the tap wrapper with
+// the genuine plugin instead. Signature matches the genuine ABI exactly
+// (int(void*, OnMessageFn), std::function passed by value).
+int w_set_on_message_fn(void* a, OnMessageFn fn) {
+    g_real_on_message = std::move(fn);
+    emit("set_on_message_fn", { B("wrapped", true) });
+    return r_set_on_message_fn(a, OnMessageFn(tap_on_message));
+}
+int w_set_on_local_message_fn(void* a, OnMessageFn fn) {
+    g_real_on_local_message = std::move(fn);
+    emit("set_on_local_message_fn", { B("wrapped", true) });
+    return r_set_on_local_message_fn(a, OnMessageFn(tap_on_local_message));
+}
+int w_set_on_user_message_fn(void* a, OnMessageFn fn) {
+    g_real_on_user_message = std::move(fn);
+    emit("set_on_user_message_fn", { B("wrapped", true) });
+    return r_set_on_user_message_fn(a, OnMessageFn(tap_on_user_message));
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -273,6 +337,9 @@ extern "C" void* dlsym(void* handle, const char* name) {
     WRAP("bambu_network_start_local_print_with_record", r_start_local_print_with_record, w_start_local_print_with_record)
     WRAP("bambu_network_start_local_print", r_start_local_print, w_start_local_print)
     WRAP("bambu_network_bind", r_bind, w_bind)
+    WRAP("bambu_network_set_on_message_fn", r_set_on_message_fn, w_set_on_message_fn)
+    WRAP("bambu_network_set_on_local_message_fn", r_set_on_local_message_fn, w_set_on_local_message_fn)
+    WRAP("bambu_network_set_on_user_message_fn", r_set_on_user_message_fn, w_set_on_user_message_fn)
 #undef WRAP
 
     return real;   // untapped symbols pass straight through

@@ -71,4 +71,11 @@ typedef std::function<void(int status, int code, std::string msg)> OnUpdateStatu
 typedef std::function<bool()>                                      WasCancelledFn;
 typedef std::function<bool(int status, std::string job_info)>      OnWaitFn;
 
+// Inbound message callback the plugin invokes to deliver MQTT reports UP to
+// Studio. Registered via bambu_network_set_on_{message,local_message,
+// user_message}_fn(void* agent, OnMessageFn fn) -> int. Signature must match the
+// genuine plugin exactly (std::function passed BY VALUE) so the tap can store
+// the host's real callback and hand the plugin a wrapper in its place.
+typedef std::function<void(std::string dev_id, std::string msg)>   OnMessageFn;
+
 }  // namespace bbl_abi

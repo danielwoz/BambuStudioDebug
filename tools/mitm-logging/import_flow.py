@@ -882,6 +882,32 @@ def recognize_ssdp(recs, args):
 
 TOPIC_REQ_RE = re.compile(r"^device/([^/]+)/request$")
 
+# Inbound ABI callbacks the plugin uses to deliver MQTT reports up to Studio.
+ABI_REPORT_FNS = ("on_message", "on_local_message", "on_user_message")
+
+
+def abi_report_records(recs, dev=None):
+    """Inbound report records captured at the plugin->Studio ABI boundary
+    (abi_tap on_message wrappers). Optionally filter to one device serial.
+    Each report's msg is anonymized (parsed JSON when possible)."""
+    out = []
+    for r in recs:
+        if r.get("_proto") != "abi" or r.get("dir") != "report":
+            continue
+        if r.get("fn") not in ABI_REPORT_FNS:
+            continue
+        a = r.get("args", {})
+        d = a.get("dev_id", "")
+        if dev and d and d != dev:
+            continue
+        msg = a.get("msg", "")
+        try:
+            body = anon(json.loads(msg))
+        except (ValueError, TypeError):
+            body = anon_str(msg)
+        out.append({"fn": r.get("fn"), "dev_id": serial_anon(d), "report": body})
+    return out
+
 
 def recognize_device_command(recs, args):
     # Prefer the ABI-CAPTURED send_message_to_printer input (the logical command
@@ -923,10 +949,18 @@ def recognize_device_command(recs, args):
             command = sub["command"]
             break
     payload_json = anon(logical)
+    # Inbound status reports captured at the ABI boundary (in the clear -- the
+    # cloud MQTT wire is cert-pinned, so this is the only way to see report
+    # content). Attached as CONTEXT only; the harness assertion stays the
+    # outbound command in steps[0].
+    reports = abi_report_records(recs, dev=dev)
+    extra = {"command": command, "driver_source": driver_source}
+    if reports:
+        extra["report_source"] = "abi-captured"
     meta = base_meta(args, flow="device_command", channel="cloud_lan",
                      model=args.model if args.model != "unknown" else "h2d",
-                     extra={"command": command, "driver_source": driver_source})
-    return {
+                     extra=extra)
+    fixture = {
         "schema": "obn-wire-flow/v1", "meta": meta,
         "driver": {"dev_id": dev_a, "access_code": "1234abcd",
                    "signed": signed, "command_json": json.dumps(anon(logical))},
@@ -938,6 +972,9 @@ def recognize_device_command(recs, args):
             "expect": {},
         }],
     }
+    if reports:
+        fixture["captured_reports"] = reports
+    return fixture
 
 
 LIST_LINE_RE = re.compile(

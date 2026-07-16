@@ -52,6 +52,24 @@ int main(int argc, char** argv) {
     std::printf("start_local_print_with_record -> %d\n", r2);
     if (r2 != 7) { std::fprintf(stderr, "FAIL: print return passthrough (got %d)\n", r2); ++fails; }
 
+    // ---- inbound report round-trip: register a real callback through the tap,
+    // then have the stub "push" a report; assert the host callback fired with
+    // the exact args (i.e. the tap forwarded plugin -> Studio faithfully).
+    auto som = (int(*)(void*, OnMessageFn))dlsym(h, "bambu_network_set_on_message_fn");
+    auto push = (void(*)(std::string, std::string))dlsym(h, "stub_push_report");
+    if (!som || !push) { std::fprintf(stderr, "dlsym report path failed\n"); return 2; }
+    std::string got_dev, got_msg; int got_calls = 0;
+    OnMessageFn cb = [&](std::string d, std::string m) { got_dev = d; got_msg = m; ++got_calls; };
+    som(nullptr, cb);
+    const std::string rep_dev = "0AF0BM12345";
+    const std::string rep_msg = "{\"system\":{\"command\":\"ledctrl\",\"result\":\"success\"}}";
+    push(rep_dev, rep_msg);
+    std::printf("on_message forwarded -> calls=%d dev=\"%s\"\n", got_calls, got_dev.c_str());
+    if (got_calls != 1 || got_dev != rep_dev || got_msg != rep_msg) {
+        std::fprintf(stderr, "FAIL: on_message not forwarded verbatim (calls=%d)\n", got_calls);
+        ++fails;
+    }
+
     // ---- Part B: genuine plugin (optional) ----
     if (genuine) {
         void* g = dlopen(genuine, RTLD_NOW | RTLD_LOCAL);

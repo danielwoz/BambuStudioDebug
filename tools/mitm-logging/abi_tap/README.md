@@ -1,10 +1,19 @@
-# ABI input-tap (genuine plugin call arguments)
+# ABI tap (genuine plugin call arguments + inbound reports)
 
-Captures the **input** side of the genuine Bambu network plugin — the actual
-arguments BambuStudio passes into `bambu_network_*` calls (`PrintParams`, JSON
-device commands, dev_id, login blob, …). The wire MITM records what the plugin
-*emits*; this tap records what the host *hands it*, so the fixture `driver` block
-becomes **captured ground-truth** instead of reconstructed from the wire output.
+Captures the genuine Bambu network plugin at the plugin↔Studio ABI boundary, in
+**both directions**:
+
+- **Outbound (input side)** — the arguments BambuStudio passes *into*
+  `bambu_network_*` calls (`PrintParams`, JSON device commands, dev_id, login
+  blob, …), so the fixture `driver` block is **captured ground-truth** instead of
+  reconstructed from the wire.
+- **Inbound (report side)** — the MQTT status reports the plugin delivers *up* to
+  Studio via the `on_message` callbacks. This reads the cloud/LAN session's
+  command + report **content in the clear at the ABI boundary**, which is the
+  only way to see cloud report content: the cloud MQTT wire itself is
+  **certificate-pinned** (embedded CA in the VMProtected BambuSource — no TLS
+  MITM, CA install, or relay defeats it; see `../../../docs/MITM_LOGGING.md`).
+  The tap sits above TLS, so pinning is irrelevant.
 
 ## Design — LD_PRELOAD `dlsym` interposition (tamper-safe)
 
@@ -25,18 +34,29 @@ that Studio loads *as* the plugin is the documented fallback — simpler but tri
 Studio's module-cert check, needing `ignore_module_cert` and forwarding of the
 version/debug gates. Not used here.)
 
-## Wrapped entry points (input-bearing)
+## Wrapped entry points
 
-`get_version` (proof), `create_agent`, `set_config_dir`, `change_user`,
-`connect_printer`, `send_message`, `send_message_to_printer`, `start_print`,
-`start_local_print`, `start_local_print_with_record`, `bind`. Everything else
-passes straight through untouched.
+**Outbound (input-bearing):** `get_version` (proof), `create_agent`,
+`set_config_dir`, `change_user`, `connect_printer`, `send_message`,
+`send_message_to_printer`, `start_print`, `start_local_print`,
+`start_local_print_with_record`, `bind`.
 
-`PrintParams` and the `std::function` callbacks are passed **by value** (=>
-hidden-pointer ABI); the wrappers share the exact struct/callback layout from
-`bambu_abi.hpp` (mirrored from the OBN abi_snapshot for the plugin's version).
-**Version-match `bambu_abi.hpp` to the plugin ABI** before tapping a different
-version whose `PrintParams` changed.
+**Inbound (callback setters → report capture):** `set_on_message_fn`,
+`set_on_local_message_fn`, `set_on_user_message_fn`. When Studio registers its
+callback, the tap stores that real callback and hands the plugin a **wrapper**
+instead. When the plugin later invokes the wrapper (from its MQTT thread) with a
+report `(dev_id, msg)`, the wrapper logs it (`"dir":"report"`, `"fn":"on_message"`
+…) then calls Studio's real callback so device state / UI update exactly as
+normal. The callback signature is `void(std::string dev_id, std::string msg)`;
+the setters are `int(void* agent, OnMessageFn fn)`.
+
+Everything else passes straight through untouched.
+
+`PrintParams`, `OnMessageFn`, and the other `std::function` callbacks are passed
+**by value** (=> hidden-pointer ABI); the wrappers share the exact struct/callback
+layout from `bambu_abi.hpp` (mirrored from the OBN abi_snapshot for the plugin's
+version). **Version-match `bambu_abi.hpp` to the plugin ABI** before tapping a
+different version whose `PrintParams` changed.
 
 ## Secrets
 
@@ -69,10 +89,35 @@ tools/mitm-logging/abi_tap/run_smoke.sh
 Part A loads a stub plugin through the tap, calls `get_version`,
 `send_message_to_printer`, and `start_local_print_with_record` with crafted args,
 and asserts the tap logged the exact args, the stub received them byte-for-byte,
-and return values passed through. Part B loads the real VMProtect'd plugin (if
-present at `~/.cache/bambu_extract_d/plugins/02.07.01.51/libbambu_networking.so`)
-and calls `get_version` through the tap to prove interposition works against the
-actual module.
+and return values passed through. It also exercises the **inbound report path**:
+it registers a callback via `set_on_message_fn` through the tap, has the stub
+"push" a report, and asserts the tap logged a `"dir":"report"` record **and** the
+host callback fired with the report verbatim. Part B loads the real VMProtect'd
+plugin (if present at
+`~/.cache/bambu_extract_d/plugins/02.07.01.51/libbambu_networking.so`) and calls
+`get_version` through the tap to prove interposition works against the actual
+module.
+
+## Inbound report capture — verified (Studio 02.07.01.57 + genuine 02.07.01.51, real H2S)
+
+`LD_PRELOAD=abi_tap.so` **alone** (no `mitm_redirect.so`, no broker redirect —
+Studio connects to the real cloud/LAN MQTT normally):
+
+- **At rest:** the `on_message` wrapper fired with real cloud report JSON the
+  printer pushes periodically — e.g. a firmware `info`/`get_version` module list,
+  and a `system`/`get_access_code` report where the tap **redacted** the
+  access_code (`"access_code":"<redacted>"`). No command needed.
+- **Light round-trip (benign, revertible):** toggling the H2S chamber light in
+  Device → Control captured **both** the outbound `send_message`
+  (`system.command=ledctrl`, `led_mode=on|off`, `chamber_light`/`chamber_light2`)
+  **and** the inbound `on_local_message` report echoing the same `sequence_id`
+  with `result:"success"` — the full command↔report round-trip in the clear,
+  through the pinned session.
+- `import_flow.py --flow device_command` folds the report in as
+  `captured_reports` context (dev_id/serial anonymized, tokens scrubbed) while the
+  outbound `ledctrl` stays the harness assertion → `WIRE-COMPLIANCE OK`.
+
+No print was started; a light toggle touches no job and is instantly revertible.
 
 ## Real-plugin validation (headless probe, no GUI)
 

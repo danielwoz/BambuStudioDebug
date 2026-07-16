@@ -34,4 +34,17 @@ int bambu_network_start_local_print_with_record(void*, PrintParams p, OnUpdateSt
     return 7;
 }
 
+// Inbound report path: the host registers a callback; whatever the stub stores
+// here is the WRAPPER the tap handed it (not the host's real callback). A later
+// stub_push_report() call simulates the plugin's MQTT thread delivering a report.
+static OnMessageFn g_stored_cb;
+int bambu_network_set_on_message_fn(void*, OnMessageFn fn) {
+    g_stored_cb = fn;
+    rec("set_on_message_fn|stored");
+    return 0;
+}
+void stub_push_report(std::string dev_id, std::string msg) {
+    if (g_stored_cb) g_stored_cb(dev_id, msg);
+}
+
 } // extern "C"

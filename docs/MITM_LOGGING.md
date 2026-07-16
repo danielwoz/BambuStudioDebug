@@ -137,6 +137,17 @@ relay's upstream TLS 1.3 to the real broker, and the importer → harness path
 remains useful for other statically-linked-OpenSSL plugins that read their CA
 store from the filesystem (not pinned).
 
+**Cloud report content is instead captured at the ABI boundary**, above TLS,
+where pinning is irrelevant: the `abi_tap` wraps the plugin's inbound
+`on_message` / `on_local_message` / `on_user_message` callbacks and logs each
+status report (`"dir":"report"`) before forwarding it to Studio unchanged. Run
+`LD_PRELOAD=abi_tap.so` alone (no redirect) and the real cloud/LAN session's
+commands **and** reports are recorded in the clear — verified live against a real
+H2S (periodic cloud reports at rest + a full chamber-light `ledctrl` round-trip).
+`import_flow.py --flow device_command` folds the report in as `captured_reports`
+context while the outbound command stays the harness assertion. See
+`tools/mitm-logging/abi_tap/README.md`.
+
 ---
 
 ## 2. Components (`tools/mitm-logging/`)
