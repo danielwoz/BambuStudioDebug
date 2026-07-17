@@ -137,12 +137,10 @@ Consequences for a TLS-interception capture of the cloud MQTT session:
 - (a) mosquitto-layer hook / (b) GOT-PLT interpose: **impossible** — the plugin's
   OpenSSL has no dynamic import to hook (no libmosquitto; verify symbols are
   internal to the packed image).
-- (c) runtime code patch of the plugin's verify decision: **feasible in
-  principle** (the unpacked code is plain x86, not virtualized, so an
-  `mprotect`+patch from a preload thread timed after unpack needs no ptrace), but
-  requires first locating the verify branch / `SSLfatal(…UNKNOWN_CA…)` site in a
-  ~12 MB stripped, string-encrypted image, and must survive any VMProtect image
-  integrity re-check. Not implemented here.
+- (c) runtime code patch of the plugin's verify decision: **implemented and
+  working** — see "Defeating the pin" below. The unpacked OpenSSL is plain x86
+  (not virtualized), the verify branch is located dynamically, and the patch
+  survives the plugin's VMProtect integrity pass by timing.
 
 Confirming test: launched **without** the MQTT redirect, the plugin connects to
 the real broker with no error — its pinned CA trusts the genuine broker — so the
@@ -163,6 +161,74 @@ status report (`"dir":"report"`) before forwarding it to Studio unchanged. Run
 `LD_PRELOAD=abi_tap.so` alone (no redirect) and the real cloud/LAN session's
 commands **and** reports are recorded in the clear — verified live against a real
 H2S (periodic cloud reports at rest + a full chamber-light `ledctrl` round-trip).
+
+### Defeating the pin — runtime x86 patch (approach c, implemented)
+
+The pin *can* be defeated in-process, capturing the genuine cloud MQTT wire
+through the existing relay, with **no ptrace and no on-disk change to the
+plugin**. Three preload objects (all built by `build_pin_bypass.sh`, none
+committed):
+
+1. **Localize the pin dynamically** (`alert_trace.c`). The rejected leaf makes
+   the plugin's OpenSSL send a *plaintext* handshake-phase fatal alert record —
+   `15 03 03 00 02 02 30` (level fatal, desc `0x30` = unknown_ca). The plugin
+   writes it through libc `write`/`send`, so interposing those and matching the
+   byte pattern yields a `backtrace()` at the emission site. Every plugin frame
+   resolves via `dladdr` into the unpacked region; the chain is OpenSSL's
+   `tls_process_server_certificate` → `SSLfatal(ssl_x509err2alert(verify_result),
+   CERTIFICATE_VERIFY_FAILED)` → alert dispatch → `write`.
+
+2. **Dump + disassemble the unpacked code.** Root-read (no ptrace/attach —
+   `open`+`pread` of `/proc/PID/mem`, which does not set `TracerPid` and does not
+   trip the plugin's anti-debug) the anonymous `r-xp` region that the backtrace
+   frames fall in, and disassemble it. The verify branch is:
+
+   ```
+   call ssl_verify_cert_chain          ; i = verify(s, sk)
+   mov  %eax,%r13d
+   mov  0x560(%r12),%eax               ; s->verify_mode
+   test %eax,%eax ; je  skip           ; VERIFY_NONE -> no check
+   test %r13d,%r13d
+   jle  fail                           ; i <= 0 -> unknown_ca   <== the gate
+   ```
+
+   Preceded by an 18-byte, image-unique lead signature ending at
+   `test %r13d,%r13d`, so the `jle` is found by content, ASLR-independent.
+
+3. **Patch it at runtime** (`pin_patch.c`, `LD_PRELOAD`). A constructor thread
+   scans **only the plugin's own mapped span** (bounded by the
+   `libbambu_networking.so` mappings — the identical OpenSSL verify branch exists
+   in Studio's *own* OpenSSL too, and must not be touched) for the signature and
+   NOP-6es the `jle`. That lets `ssl_verify_cert_chain` (and Bambu's app pin
+   callback) run fully but removes the fatal-on-failure abort, so the handshake
+   completes.
+
+**Surviving VMProtect's integrity check — the one real wall.** Writing those
+bytes at startup crashes the plugin within ~1 s (confirmed a **content** check,
+not a page-permission one: writing via `/proc/self/mem` with the page left
+`r-xp` crashes identically; a locate-only dry-run never does). The check is
+**one-time**, during plugin init. `PIN_PATCH_DELAY_MS` therefore locates the
+branch immediately but arms the write only after the delay (~60 s — past init and
+login). With the integrity pass already complete, the patch takes and holds; the
+cloud MQTT reconnect then completes through the relay. Studio's own later TLS
+keeps working, confirming the check does not re-run per handshake.
+
+Result (live, genuine plugin + real H2S, idle): the relay logs
+`upstream TLS to us.mqtt.bambulab.com:8883 established` with **no**
+`TLSV1_ALERT_UNKNOWN_CA`, and the real cloud device session is captured —
+`CONNECT slicer:<uid>:… (username+token)`, `SUBSCRIBE device/<serial>/report`,
+and bidirectional `request`/`report` publishes (`pushall`, `get_version`,
+`get_access_code`, `app_cert_install`, `push_status`). `import_flow.py --flow
+device_command` → fixture → `wire_compliance_test` → `WIRE-COMPLIANCE OK`.
+
+    LD_PRELOAD="pin_patch.so:mitm_redirect.so" REDIRECT_MQTT8883=9883 \
+        PIN_PATCH_DELAY_MS=60000 <studio>          # + mqtt_cloud_relay.py on :9883
+
+The one-time-integrity timing is the crux: an immediate patch trips it; a patch
+armed after init does not. Prereqs to load the genuine plugin under a self-built
+Studio: `app.ignore_module_cert=1` in `BambuStudio.conf` (skip the same-publisher
+module-signature check) and a plugin whose version family matches Studio's
+`SLIC3R_VERSION` first 8 chars (`02.07.01`).
 `import_flow.py --flow device_command` folds the report in as `captured_reports`
 context while the outbound command stays the harness assertion. See
 `tools/mitm-logging/abi_tap/README.md`.

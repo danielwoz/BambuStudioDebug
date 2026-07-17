@@ -54,3 +54,5 @@ tools/mitm-logging/abi_tap/probe
 tools/mitm-logging/relay_cert.pem
 tools/mitm-logging/relay_key.pem
 __pycache__/
+tools/mitm-logging/alert_trace.so
+tools/mitm-logging/pin_patch.so
