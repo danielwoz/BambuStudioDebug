@@ -130,10 +130,12 @@ static void plog(const char *fmt, ...)
 {
     FILE *f = fopen(logpath(), "a");
     if (!f) return;
-    time_t t = time(NULL);
+    struct timespec tv;
+    clock_gettime(CLOCK_REALTIME, &tv);
+    time_t t = tv.tv_sec;
     char ts[32];
     strftime(ts, sizeof ts, "%H:%M:%S", localtime(&t));
-    fprintf(f, "[%s] ", ts);
+    fprintf(f, "[%s.%03ld] ", ts, tv.tv_nsec / 1000000);
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
     fputc('\n', f);
     fclose(f);

@@ -217,3 +217,95 @@ the other device commands above ARE captured on the real cloud wire. Closing thi
 gap needs the FIRST cloud connection to succeed cleanly (pin down before Studio's
 initial connect, which the init-integrity check forbids for ~60 s) or a
 plugin-side connection-state fix beyond the transport MITM.
+
+## UI-online residual — timeline, the exit(0) checker, and the device-leg wall
+
+A dedicated pass measured the timeline precisely and pushed the UI-online residual
+much further. Key corrections and new findings (genuine plugin `f6f8a47b`,
+02.07.01.51, Studio 02.07.01.57 headless, logged in):
+
+### Environment prerequisite (was silently broken)
+
+The residual can only be studied with the **genuine** plugin actually loaded. A
+stale, wrong plugin (`58a95cf7`) had been left installed; Studio rejects it
+("Failed to download the plug-in"), logs the account out, and every "offline"
+observation under it is confounded. Installing the genuine `f6f8a47b`
+(`~/.cache/bambu_extract_d/plugins/02.07.01.51/`) restores login and a healthy
+online baseline (direct cloud: H2S online, temps populate, Lamp enabled).
+
+### Measured timeline (from process launch)
+
+- `~1 s`  — pin branch located (plugin OpenSSL unpacked).
+- `~10.7 s` — Studio's FIRST cloud-MQTT connect **and** the one-shot init
+  integrity check fire together. Patching the pin before this point kills the
+  process at ~first-connect **before any connect reaches the relay**, so there is
+  **no clean `[init-clear, first-connect)` window** — the init check *is* gated on
+  the first TLS use. The task's primary approach is therefore impossible.
+- Cloud retry cadence (pairs, growing backoff): `~10.7, 13.4, 22.4, 37.4, 52.4 s`.
+- Periodic re-scan: roughly periodic ~9–14 s; the budget after a late patch varies
+  with phase (measured deaths at +5, +9.2, +13.9 s).
+
+### The integrity check kills via `exit(0)` — and it is interceptable
+
+`death_trace` never saw the init-check death because it is **not** a signal or
+`std::terminate`: the checker calls plain libc `exit(0)` from
+`libbambu_networking.so+0x250f50` (worker-thread entry `+0x5584f5`) — the SAME
+function the periodic `std::terminate` (`+0x2f2980`) routes through. A new
+`exit_trace.c` LD_PRELOAD shim interposes `exit/_exit/_Exit/quick_exit/abort`
+(plus `kill/tgkill/raise`), logs plugin-frame callers, and can neutralize the
+plugin's exit:
+- `EXIT_BLOCK_PLUGIN=2` **parks** the calling thread — process survives with the
+  pin held down **indefinitely**, and crucially with **no** secondary SIGSEGV
+  (unlike `tamper_park`'s terminate interception, control E).
+- `EXIT_BLOCK_PLUGIN=1` **returns** to the caller — the checker continues but
+  falls into the second-stage `std::thread`-dtor `std::terminate` and dies.
+
+### Breakthrough: the account/server UI can be brought ONLINE
+
+Holding the pin down indefinitely (`exit_trace` park, applied **post-boot** so the
+init check passed on pristine code and Studio booted) and then forcing Studio's
+own server reconnect (click the "Failed to connect to the server" banner) makes the
+account/cloud connection **succeed**: the banner clears, and the device selector
+lists all printers with **green online dots**. This is strictly past the prior
+residual, which could never clear the server latch. It required the *indefinite*
+pin-down that only the exit-park enables (the restore method's ~7 s window is too
+short to clear the latch).
+
+### Remaining wall: the per-device leg needs the parked thread
+
+With the account online, selecting the H2S drives a device connect ("Connecting…")
+but it never completes — no `device/<serial>` subscribe/reports appear, temps stay
+`N/A`, Lamp stays disabled. Diagnosis:
+- The only cloud socket is the relay (`:9883`); there is no separate external
+  tunnel — the device leg rides the same cloud MQTT.
+- The worker thread the exit-park **parks** is the one that drives the device
+  subscribe/handshake, so parking it (the only way to survive with the pin down
+  indefinitely) stalls the device leg. Letting it run instead (`=1` return) hits
+  the second-stage `std::terminate` and dies. The anti-tamper is multi-layered on
+  a networking-critical thread, so there is no stable config that is both
+  pin-down-indefinite **and** device-networking-functional via LD_PRELOAD alone.
+
+The clean fix is to patch the checker itself (`+0x250f50`) so it never signals
+tamper — leaving the thread fully functional — rather than intercepting its exit;
+that is static RE of the hash routine, the "sturdier alternative" noted above.
+
+### Transport bug fixed along the way
+
+`mitm_redirect.c` rewrote `api.bambulab.com` to a loopback sentinel
+*unconditionally*, but only redirects `:443` when `REDIRECT_443` is set. With only
+`REDIRECT_MQTT8883` in use (the residual setup) Studio's cloud REST therefore
+dialed a dead `127.0.0.2:443` and failed with a cert/host error — breaking the
+device-connect handshake in every prior attempt. The rewrite is now gated on
+`REDIRECT_443`, so api.bambulab.com resolves directly when no `:443` proxy is
+configured. After this fix the device leg progresses to a persistent
+"Connecting…" (vs. an immediate "Failed") — necessary but not sufficient given the
+thread wall above.
+
+### Net status
+
+- ONLINE achieved for the **account/server** connection (green device dots) under
+  the MITM — new.
+- The **per-device** connection (and thus the Lamp / `ledctrl`) remains blocked by
+  the checker-thread entanglement; the `ledctrl` GUI round-trip could not be
+  captured. No `ledctrl` or any device command was ever emitted (Lamp stayed
+  disabled throughout); the H2S was never sent a command.

@@ -319,13 +319,23 @@ def main():
     sys.stderr.write(f"[mqtt-cloud] {args.listen_host}:{args.listen_port} -> "
                      f"{args.broker}:{args.broker_port} log={args.out} "
                      f"upstream_mtls={'on' if args.upstream_cert else 'off'}\n")
+    accepts = 0
     try:
         while True:
-            raw, _ = ls.accept()
+            raw, peer = ls.accept()
+            accepts += 1
+            # Timestamp every inbound TCP accept (before the TLS handshake) so the
+            # first cloud-connect attempt can be timed precisely against the pin
+            # patcher's arm/restore events -- this is what determines whether the
+            # pin is down for Studio's FIRST cloud connect.
+            sys.stderr.write(f"[mqtt-cloud] accept #{accepts} at "
+                             f"{time.strftime('%H:%M:%S')}.{int(time.time()*1000)%1000:03d} "
+                             f"from {peer}\n")
+            sys.stderr.flush()
             try:
                 ss = srv_ctx.wrap_socket(raw, server_side=True)
             except ssl.SSLError as e:
-                sys.stderr.write(f"[mqtt-cloud] TLS accept failed: {e}\n")
+                sys.stderr.write(f"[mqtt-cloud] TLS accept #{accepts} failed: {e}\n")
                 continue
             threading.Thread(target=handle, args=(ss, args, fh), daemon=True).start()
     except KeyboardInterrupt:

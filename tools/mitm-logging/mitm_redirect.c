@@ -91,7 +91,13 @@ int getaddrinfo(const char *node, const char *service,
   if (r != 0 || !node || !res || !*res)
     return r;
   unsigned int rewrite = 0;
-  if (strcasecmp(node, "api.bambulab.com") == 0)
+  // Only steer api.bambulab.com to the loopback sentinel when a :443 proxy is
+  // actually listening (REDIRECT_443). Otherwise connect() has no relay to send
+  // the sentinel to and would dial the dead 127.0.0.2:443, breaking Studio's
+  // cloud REST (device-connect handshake, profile) with a cert/host error. When
+  // only the cloud-MQTT relay is in use, api.bambulab.com must resolve directly.
+  const char *r443 = getenv("REDIRECT_443");
+  if (strcasecmp(node, "api.bambulab.com") == 0 && r443 && r443[0])
     rewrite = SENTINEL;
   else if (is_cloud_mqtt_host(node))
     rewrite = CLOUD_MQTT_SENT;
