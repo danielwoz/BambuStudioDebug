@@ -54,8 +54,11 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 
 LOG_LOCK = threading.Lock()
+SENTINEL_LOCK = threading.Lock()
+SENTINEL_DONE = False
 
 PKT = {1: "CONNECT", 2: "CONNACK", 3: "PUBLISH", 4: "PUBACK", 8: "SUBSCRIBE",
        9: "SUBACK", 12: "PINGREQ", 13: "PINGRESP", 14: "DISCONNECT"}
@@ -65,6 +68,36 @@ def log(fh, rec):
     with LOG_LOCK:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         fh.flush()
+
+
+def signal_established(path):
+    """Atomically create the cloud-established sentinel the pin patcher polls.
+
+    Fired exactly once, when the plugin's cloud CONNECT has been read THROUGH the
+    relay (upstream TLS already established, client leg accepted, CONNECT seen) --
+    i.e. the cloud-broker TLS handshake genuinely completed. The event-driven
+    restore in pin_patch keys off this file's appearance so the original bytes are
+    put back only AFTER the handshake, never during a pre-establishment retry."""
+    global SENTINEL_DONE
+    if not path:
+        return
+    with SENTINEL_LOCK:
+        if SENTINEL_DONE:
+            return
+        SENTINEL_DONE = True
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(int(time.time())) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, path)          # atomic appearance
+        sys.stderr.write(f"[mqtt-cloud] cloud session established -> sentinel {path}\n")
+    except OSError as e:
+        sys.stderr.write(f"[mqtt-cloud] sentinel write failed: {e}\n")
 
 
 def ensure_cert(cert, key):
@@ -220,6 +253,12 @@ def handle(client_ss, args, fh):
                     break
                 parse_and_log(raw, ptype, flags, fh, direction)
                 dst.sendall(raw)
+                # Cloud session is established once the plugin's CONNECT has
+                # traversed the relay upstream (TLS handshakes on both legs are
+                # complete by now). Signal the pin patcher to restore pristine
+                # code -- the handshake is done, so the live session is unaffected.
+                if direction == "c2s" and ptype == 1:
+                    signal_established(args.established_sentinel)
         except OSError:
             pass
         finally:
@@ -252,6 +291,10 @@ def main():
                          "mTLS on print-command topics (BBL_MTLS_CERT)")
     ap.add_argument("--upstream-key", default=None,
                     help="client key for --upstream-cert (BBL_MTLS_KEY)")
+    ap.add_argument("--established-sentinel", default=None,
+                    help="path to atomically create when the cloud CONNECT has "
+                         "traversed the relay; pin_patch PIN_PATCH_RESTORE_ON "
+                         "polls it to trigger the event-driven code restore")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))

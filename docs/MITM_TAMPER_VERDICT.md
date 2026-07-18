@@ -158,3 +158,62 @@ LD_PRELOAD=death_trace.so:pin_patch.so \
 ```
 
 Add `tamper_park.so` at the front of `LD_PRELOAD` to neutralise the self-destruct.
+
+## Event-driven restore — STABLE cloud capture (the shipped path)
+
+Control F's fixed `PIN_PATCH_RESTORE_MS` timer worked as a *defeat* but was racy
+for *capture* (its 5 s timer could restore before the handshake landed, or — with
+the loop counting iterations rather than wall time — drift past the ~13 s scan and
+self-destruct anyway). Both problems are removed by driving the restore off the
+actual handshake:
+
+- **`mqtt_cloud_relay.py`** writes a sentinel file (`--established-sentinel`,
+  e.g. `/tmp/bbl_capture/cloud_established`) atomically the instant the plugin's
+  cloud CONNECT traverses the relay (upstream TLS established + client CONNECT
+  seen) — i.e. the moment the cloud-broker handshake genuinely completed.
+- **`pin_patch.c` `PIN_PATCH_RESTORE_ON=<sentinel>`** keeps the pin DOWN through
+  any pre-establishment `unknown_ca` retry, then restores the pristine `jle` as
+  soon as the sentinel appears (`PIN_PATCH_RESTORE_SETTLE_MS` optionally dwells a
+  few seconds first), with a hard `PIN_PATCH_RESTORE_MAX_MS` fallback so the
+  restore ALWAYS precedes the scan. Restore timing is now **wall-clock**
+  (`CLOCK_MONOTONIC`), not loop-iteration counted — the per-pass memmem over the
+  plugin's ~30 MB unpacked span makes iteration timers drift badly (a fixed-timer
+  full-window run measured 11 000 "loop ms" but elapsed >13 s wall and hit the
+  self-destruct; the event-driven sentinel path is immune because it fires on the
+  real file event).
+
+**Result (verified live, genuine plugin 02.07.01.51, Studio 02.07.01.57 headless,
+account logged in):** repeated runs establish the cloud session through the relay
+and SURVIVE well past the scan. Representative timing:
+
+```
+patched          15:50:10
+established       15:50:17  (relay: upstream TLS + CONNECT -> sentinel)
+RESTORED          15:50:17  (trigger=sentinel, +4.6 s)  -- another run +6.0 s
+scan survived     15:51:02+ (52 s post-patch; death_bt clean, no terminate)
+```
+
+The captured wire is a real bidirectional cloud session for the H2S:
+`CONNECT` (username=cloud uid, redacted), `SUBSCRIBE user/<uid>/request` +
+`device/<serial>/report`, and publishes to `device/<serial>/request`
+(`pushall`, `get_version`, `get_access_code`, `app_cert_install`) with the
+matching `device/<serial>/report` pushes (`push_status` incl. a full ~9 KB state
+dump, then live deltas). The pin is pristine before the re-scan, so the process
+lives and the session persists.
+
+### Residual gap — GUI device stays "offline", so ledctrl can't be GUI-driven
+
+Capturing a *specific interactive* command (the chamber-light `ledctrl`) also
+needs Studio's Device→Control panel to be enabled, which is gated on the machine
+showing **online**. Under the MITM it never does: the pin blocks Studio's FIRST
+cloud handshake at startup, Studio latches a failed "server connection" (orange
+`Failed to connect to the server` banner, red wifi-off on the device), and the
+later pin-down reconnect — though it establishes the raw MQTT session that the
+relay captures — does not clear that latched UI state. The device temperatures
+never populate and the Lamp button stays disabled, across every reconnect nudge
+tried (Device-tab entry, machine re-select, server-reconnect banner, all during
+and after pin-down). So the light round-trip specifically could not be driven;
+the other device commands above ARE captured on the real cloud wire. Closing this
+gap needs the FIRST cloud connection to succeed cleanly (pin down before Studio's
+initial connect, which the init-integrity check forbids for ~60 s) or a
+plugin-side connection-state fix beyond the transport MITM.

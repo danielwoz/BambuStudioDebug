@@ -46,6 +46,18 @@
 //        PIN_PATCH_DELAY_MS=60000             (arm after init check)
 //        PIN_PATCH_PROCMEM=1                  (write via /proc/self/mem, no mprotect)
 //        PIN_PATCH_RESTORE_MS=5000            (restore original bytes -> evade re-scan)
+//        PIN_PATCH_RESTORE_ON=<sentinel path> (event-driven restore: put the
+//                                              original bytes back as soon as the
+//                                              relay signals the cloud session is
+//                                              established, i.e. AFTER the TLS
+//                                              handshake completed through it)
+//        PIN_PATCH_RESTORE_MAX_MS=8000        (hard fallback: restore no later than
+//                                              this many ms after patching, so the
+//                                              restore always beats the ~13s scan)
+//        PIN_PATCH_RESTORE_SETTLE_MS=0         (dwell this long AFTER the sentinel
+//                                              before restoring -- lets the session
+//                                              settle / a GUI command be driven while
+//                                              the pin is still down; capped by MAX_MS)
 
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -101,6 +113,17 @@ static const char *logpath(void)
 {
     const char *p = getenv("PIN_PATCH_LOG");
     return (p && *p) ? p : "/tmp/pin_patch.log";
+}
+
+// Wall-clock milliseconds (monotonic). The restore deadline must be measured in
+// real time, not loop iterations: each scan pass memmem's the plugin's ~30 MB
+// unpacked span, so a 100 ms nanosleep budget actually elapses much more wall
+// time, and iteration-counted timers drift past the ~13 s self-destruct scan.
+static long now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
 static void plog(const char *fmt, ...)
@@ -258,7 +281,22 @@ static void *worker(void *arg)
     long restore_ms = 0;
     const char *r = getenv("PIN_PATCH_RESTORE_MS");
     if (r && *r) restore_ms = atol(r);
-    long first_patched_i = -1;
+    // Event-driven restore: put pristine bytes back the moment the relay reports
+    // the cloud session is established (sentinel file appears), with a hard
+    // upper bound so the restore always precedes the ~13s integrity re-scan.
+    const char *restore_on = getenv("PIN_PATCH_RESTORE_ON");
+    long restore_max_ms = 8000;
+    const char *rmax = getenv("PIN_PATCH_RESTORE_MAX_MS");
+    if (rmax && *rmax) restore_max_ms = atol(rmax);
+    // Optional dwell AFTER the sentinel appears before restoring, so the freshly
+    // established session can fully settle (and, when capturing an interactive
+    // command, so the GUI has a moment to act while the pin is still down). Still
+    // bounded by restore_max_ms so it never crosses the self-destruct scan.
+    long restore_settle_ms = 0;
+    const char *rset = getenv("PIN_PATCH_RESTORE_SETTLE_MS");
+    if (rset && *rset) restore_settle_ms = atol(rset);
+    long patched_at_ms = -1;    // wall time the pin was first applied
+    long sentinel_at_ms = -1;   // wall time the sentinel first appeared
     long located_at = -1;
     for (int i = 0; i < 6000; i++) {
         int np = 0;
@@ -267,13 +305,33 @@ static void *worker(void *arg)
         // Restore the original bytes once the post-patch window elapses, so the
         // plugin's periodic integrity re-scan finds pristine code and does not
         // self-destruct. After restoring, patching is disabled (g_restored).
-        if (restore_ms > 0 && !g_restored && g_have_orig && g_patched_jle) {
-            if (first_patched_i < 0) first_patched_i = i;
-            if ((long)(i - first_patched_i) * 100 >= restore_ms) {
+        if ((restore_ms > 0 || (restore_on && *restore_on)) &&
+            !g_restored && g_have_orig && g_patched_jle) {
+            if (patched_at_ms < 0) patched_at_ms = now_ms();
+            long elapsed_ms = now_ms() - patched_at_ms;
+            int do_restore = 0;
+            const char *why = NULL;
+            if (restore_on && *restore_on) {
+                // Keep the pin DOWN through any pre-establishment retry (the plugin
+                // may have already failed once with unknown_ca and will retry); only
+                // restore once the handshake actually completed (sentinel present),
+                // then dwell restore_settle_ms so the session settles -- but never
+                // past the hard max, which is guaranteed to precede the ~13s scan.
+                if (sentinel_at_ms < 0 && access(restore_on, F_OK) == 0)
+                    sentinel_at_ms = now_ms();
+                if (sentinel_at_ms >= 0 && now_ms() - sentinel_at_ms >= restore_settle_ms) {
+                    do_restore = 1; why = "sentinel";
+                } else if (elapsed_ms >= restore_max_ms) {
+                    do_restore = 1; why = "max-wait";
+                }
+            } else if (elapsed_ms >= restore_ms) {
+                do_restore = 1; why = "timer";
+            }
+            if (do_restore) {
                 if (write6_procmem(g_patched_jle, g_orig)) {
                     g_restored = 1;
-                    plog("RESTORED original bytes at %p after %ld ms (tamper-scan evasion)",
-                         (void *)g_patched_jle, restore_ms);
+                    plog("RESTORED original bytes at %p after %ld ms (trigger=%s, tamper-scan evasion)",
+                         (void *)g_patched_jle, elapsed_ms, why);
                 } else {
                     plog("RESTORE failed at %p", (void *)g_patched_jle);
                 }
