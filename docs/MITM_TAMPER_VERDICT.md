@@ -309,3 +309,105 @@ thread wall above.
   the checker-thread entanglement; the `ledctrl` GUI round-trip could not be
   captured. No `ledctrl` or any device command was ever emitted (Lamp stayed
   disabled throughout); the H2S was never sent a command.
+
+## Checker RE + resolution: device leg ONLINE with pin down indefinitely
+
+A static-RE pass dumped the plugin's unpacked r-x regions from a healthy running
+Studio via root `/proc/PID/mem` (read-only, no ptrace) and rebased them. It maps
+the integrity checker exactly and resolves the prior "park stalls networking"
+wall as a misdiagnosis. Genuine plugin `f6f8a47b` (02.07.01.51), Studio 02.07.01.57
+headless, logged in.
+
+### Structure of the checker (how many layers, self-inclusive?)
+
+The plugin runs a **dedicated `std::thread` integrity monitor** whose entire
+callable is a PLAIN-x86 loop at `+0x250ec0` (thread-invoke trampoline `+0x5584f5`
+dispatches it via `call [rax+0x10]`; the loop's `call exit` return address
+`+0x250f50` is the frame seen in every death backtrace). The loop is NOT a
+networking thread — it only sleeps ~100 ms/iteration and every 300 iterations
+calls two helpers and decides in plain x86:
+
+```
++0x250f32  mov  edi,1
++0x250f37  call funcA           ; 0x351990 -> bnd jmp 0x..19dc3c  (VMProtect-virtualized)
++0x250f3c  test al,al
++0x250f3e  jne  +0x250f49       ; funcA != 0  -> EXIT path
++0x250f40  call funcB           ; 0x3528d0 -> bnd jmp 0x..bc7e9c  (VMProtect-virtualized): the hash
++0x250f45  test al,al
++0x250f47  jne  +0x250efd       ; funcB != 0  -> PASS, continue loop
++0x250f49  xor  edi,edi
++0x250f4b  call exit            ; 0x351d70 -> exit(0)  (periodic path's atexit +0x2f2980 -> std::terminate)
++0x250f50  mov  rax,[rbp+0x138]
+```
+
+- The **hash helpers funcA/funcB are VMProtect-virtualized** (thunks `bnd jmp`
+  into the VM bytecode regions; junk-mutated instruction streams, `pushfq/popfq`
+  VM entries). They cannot be cheaply read, but they only **return a boolean** —
+  the exit/terminate DECISION is the two plain-x86 branches above.
+- The imul-magic `0x1b4e81b5` and the masked decision signature each occur
+  **exactly once** in the image: a single monitor loop / single decision site.
+- The init one-shot `exit(0)` and the periodic `std::terminate` are the **same
+  loop** at different phases (terminate is just exit()'s atexit handler `+0x2f2980`).
+
+### The self-referential wall (why "patch the checker" fails)
+
+`checker_patch.c` forces the decision to always-pass without touching the hash:
+`+0x250f3e 75 09 -> 90 90` (ignore funcA) and `+0x250f47 75 b4 -> eb b4` (jmp
+continue). This is sink-agnostic: even if funcB hashes the loop and returns
+"tampered", the loop can no longer reach exit/terminate. It applies cleanly
+(single unique site) and Studio boots — **but ~1 s later the plugin sends itself
+`kill(pid, SIGKILL)` from a SECOND, independent guard at `+0x10fd860`** (captured
+via an interposed `kill`; death_bt otherwise clean). That guard is itself
+**VMProtect-virtualized** (`push 0x1a3; jmp <vm>` handler dispatch) and fires on
+**modification of the monitor loop's own bytes** — i.e. the checker is
+**self-inclusive**, guarded by a second virtualized layer whose response is an
+un-interposable hard kill. So there are **≥2 stacked, self-referential layers**
+(plain decision loop + virtualized self-hash→SIGKILL), and modifying the checker
+code is strictly counter-productive — it trips the very layer that can't be
+patched or caught. This is the precise wall for the "patch the checker" approach.
+
+### What works: leave the checker PRISTINE, park its exit sink
+
+Because the periodic **pin-NOP** detection routes through the plain-x86 loop's
+`exit(0)` (funcB returns a boolean; the loop calls exit), and the SIGKILL guard
+only fires on **code** modification, the clean neutralization is to leave every
+checker byte pristine and **park the loop's `exit(0)`**: `exit_trace.so`
+`EXIT_BLOCK_PLUGIN=2`. The monitor thread parks on its first (and only) exit call;
+no atexit handler runs (no `std::terminate`), no SIGKILL (no code was touched),
+and — decisively — **networking is unaffected**, because the parked thread is the
+dedicated monitor, NOT a networking thread. The prior "parking stalls the device
+leg" verdict was a misattribution (the real blocker was the `api.bambulab.com`
+`:443` redirect bug, since fixed).
+
+### Result — device leg ONLINE, live cloud report stream captured
+
+`run_exitpark.sh`: `LD_PRELOAD=exit_trace.so:death_trace.so:pin_patch.so:mitm_redirect.so`,
+`EXIT_BLOCK_PLUGIN=2`, `PIN_PATCH_DELAY_MS=12000` (init check passes on pristine
+code), **no restore** (pin down indefinitely), relay on `:9883`, `REDIRECT_MQTT8883=9883`.
+
+```
+patched            +18s   pin NOP resident (66 0f 1f 44 00 00), never restored
+cloud established  +21s   relay: upstream TLS us.mqtt.bambulab.com:8883 + CONNECT
+exit(0) PARKED     +34s   monitor loop detected the NOP -> parked (1x, only thread)
+alive              +396s+ pin STILL resident, death_bt clean, no terminate/SIGKILL
+```
+
+- **The H2S device leg comes fully ONLINE** (Device tab: green wifi, temps
+  populate 27/24/25 °C, camera live, **Lamp button ENABLED**, live print status).
+  This strictly exceeds the prior residual (which could never clear the device
+  leg). Screenshots: `task/ep1/device_*.png`.
+- **Live cloud device wire captured** on `device/<serial>/report` (incl. a full
+  ~9 KB `push_status` with `lights_report`, AMS, temps, `gcode_state`) plus the
+  `device/<serial>/request` handshake (`pushall`, `get_version`,
+  `get_access_code`, `app_cert_install`). Anonymized into a `device_command`
+  fixture; `obn build/wire_compliance_test` → **WIRE-COMPLIANCE OK**.
+
+### `ledctrl` residual (bonus, cleanly walled)
+
+Clicking the (isolated) Lamp control emits **no traffic on the account-MQTT
+relay** (wire delta 0). Interactive device **commands** (`ledctrl`) route over the
+separate **C2D BambuTunnel** path, not the account report broker the relay
+terminates, so the light round-trip is not capturable through this transport MITM
+and was skipped (no print control was ever touched; the pre-existing print read
+`gcode_state:FINISH`). Capturing `ledctrl` would need a BambuTunnel/mTLS command
+interceptor, out of scope here.
