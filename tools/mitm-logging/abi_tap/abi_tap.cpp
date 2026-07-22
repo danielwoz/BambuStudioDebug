@@ -29,7 +29,10 @@
 #include <mutex>
 #include <regex>
 #include <string>
+#include <atomic>
+#include <functional>
 #include "bambu_abi.hpp"
+#include "bambu_camera_abi.hpp"
 
 using namespace bbl_abi;
 
@@ -210,6 +213,53 @@ int         (*r_set_on_user_message_fn)(void*, OnMessageFn) = nullptr;
 OnMessageFn g_real_on_message;
 OnMessageFn g_real_on_local_message;
 OnMessageFn g_real_on_user_message;
+
+// --- camera path: plugin get_camera_url + libBambuSource Bambu_* ABI ---------
+using CamUrlCb = std::function<void(std::string)>;
+int (*r_get_camera_url)(void*, std::string, CamUrlCb) = nullptr;
+int (*r_get_camera_url_for_golive)(void*, std::string, std::string, CamUrlCb) = nullptr;
+
+int  (*r_Bambu_Create)(bbl_cam::Bambu_Tunnel*, char const*) = nullptr;
+void (*r_Bambu_SetLogger)(bbl_cam::Bambu_Tunnel, bbl_cam::Logger, void*) = nullptr;
+int  (*r_Bambu_Open)(bbl_cam::Bambu_Tunnel) = nullptr;
+int  (*r_Bambu_StartStream)(bbl_cam::Bambu_Tunnel, bool) = nullptr;
+int  (*r_Bambu_StartStreamEx)(bbl_cam::Bambu_Tunnel, int) = nullptr;
+int  (*r_Bambu_GetStreamCount)(bbl_cam::Bambu_Tunnel) = nullptr;
+int  (*r_Bambu_GetStreamInfo)(bbl_cam::Bambu_Tunnel, int, bbl_cam::Bambu_StreamInfo*) = nullptr;
+int  (*r_Bambu_ReadSample)(bbl_cam::Bambu_Tunnel, bbl_cam::Bambu_Sample*) = nullptr;
+int  (*r_Bambu_SendMessage)(bbl_cam::Bambu_Tunnel, int, char const*, int) = nullptr;
+void (*r_Bambu_Close)(bbl_cam::Bambu_Tunnel) = nullptr;
+void (*r_Bambu_Destroy)(bbl_cam::Bambu_Tunnel) = nullptr;
+
+// The host's REAL logger, captured at Bambu_SetLogger so the tap can surface the
+// genuine BambuSource's internal log lines (its RTSP/TUTK/Agora dialing chatter)
+// then forward to Studio unchanged.
+std::atomic<bbl_cam::Logger> g_real_source_logger{nullptr};
+
+// Per-tunnel ReadSample frame counter (opaque tunnel ptr -> count). A small
+// fixed table avoids locking/allocating on the streaming thread hot path.
+std::atomic<unsigned long long> g_frame_seq{0};
+
+// Short hex of the first `n` bytes of a frame buffer + a 64-bit FNV-1a hash of
+// the whole buffer. Lets us fingerprint each demuxed sample (JPEG FFD8 / H.264
+// Annex-B 00000001<nal> / SPS-PPS) without dumping the video itself.
+std::string frame_prefix_hex(const unsigned char* b, int size, int n) {
+    if (!b || size <= 0) return "";
+    int m = size < n ? size : n;
+    static const char* hx = "0123456789abcdef";
+    std::string o;
+    o.reserve(m * 2);
+    for (int i = 0; i < m; ++i) { o += hx[b[i] >> 4]; o += hx[b[i] & 0xf]; }
+    return o;
+}
+std::string frame_hash_hex(const unsigned char* b, int size) {
+    if (!b || size <= 0) return "0";
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < size; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    char buf[20];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h);
+    return buf;
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -305,6 +355,131 @@ int w_set_on_user_message_fn(void* a, OnMessageFn fn) {
     return r_set_on_user_message_fn(a, OnMessageFn(tap_on_user_message));
 }
 
+// --- camera URL (plugin) ---------------------------------------------------
+// Studio asks the plugin for a camera URL and the plugin hands it back through a
+// callback. We wrap the callback so we log the EXACT URL the genuine plugin
+// chose (LAN bambu:///local, rtsp(s), or a cloud URL) -- this is the single most
+// important datum for "which transport" and it is scrubbed for user/passwd.
+int w_get_camera_url(void* a, std::string dev_id, CamUrlCb cb) {
+    emit("get_camera_url", { S("dev_id", dev_id) });
+    CamUrlCb real = std::move(cb);
+    CamUrlCb wrap = [real, dev_id](std::string url) {
+        emit_report("get_camera_url_result", dev_id, url);
+        if (real) real(std::move(url));
+    };
+    return r_get_camera_url(a, dev_id, std::move(wrap));
+}
+int w_get_camera_url_for_golive(void* a, std::string dev_id, std::string sdev_id, CamUrlCb cb) {
+    emit("get_camera_url_for_golive", { S("dev_id", dev_id), S("sdev_id", sdev_id) });
+    CamUrlCb real = std::move(cb);
+    CamUrlCb wrap = [real, dev_id](std::string url) {
+        emit_report("get_camera_url_for_golive_result", dev_id, url);
+        if (real) real(std::move(url));
+    };
+    return r_get_camera_url_for_golive(a, dev_id, sdev_id, std::move(wrap));
+}
+
+// --- libBambuSource Bambu_* camera ABI -------------------------------------
+// The genuine BambuSource logs its own progress through Studio's Logger. We tap
+// that so its RTSP/TUTK/Agora dialing and handshake chatter lands in our NDJSON.
+void tap_source_logger(void* ctx, int level, bbl_cam::tchar const* msg) {
+    if (msg) emit("source_log", { I("level", level), Sr("msg", std::string(msg)) });
+    bbl_cam::Logger real = g_real_source_logger.load();
+    if (real) real(ctx, level, msg);
+}
+
+int w_Bambu_Create(bbl_cam::Bambu_Tunnel* tunnel, char const* path) {
+    // path is the camera URL Studio built from get_camera_url; scrub user/passwd.
+    emit("Bambu_Create", { {"tunnel_out", std::to_string((long long)(intptr_t)tunnel), false},
+                           Sr("url", path ? std::string(path) : std::string()) });
+    return r_Bambu_Create(tunnel, path);
+}
+void w_Bambu_SetLogger(bbl_cam::Bambu_Tunnel t, bbl_cam::Logger logger, void* ctx) {
+    g_real_source_logger.store(logger);
+    emit("Bambu_SetLogger", { {"tunnel", std::to_string((long long)(intptr_t)t), false},
+                              B("wrapped", true) });
+    return r_Bambu_SetLogger(t, tap_source_logger, ctx);
+}
+int w_Bambu_Open(bbl_cam::Bambu_Tunnel t) {
+    emit("Bambu_Open", { {"tunnel", std::to_string((long long)(intptr_t)t), false} });
+    int rc = r_Bambu_Open(t);
+    emit("Bambu_Open_ret", { {"tunnel", std::to_string((long long)(intptr_t)t), false}, I("rc", rc) });
+    return rc;
+}
+int w_Bambu_StartStream(bbl_cam::Bambu_Tunnel t, bool video) {
+    emit("Bambu_StartStream", { {"tunnel", std::to_string((long long)(intptr_t)t), false}, B("video", video) });
+    int rc = r_Bambu_StartStream(t, video);
+    emit("Bambu_StartStream_ret", { I("rc", rc) });
+    return rc;
+}
+int w_Bambu_StartStreamEx(bbl_cam::Bambu_Tunnel t, int type) {
+    {
+        char hx[16]; std::snprintf(hx, sizeof hx, "0x%x", type);
+        emit("Bambu_StartStreamEx", { {"tunnel", std::to_string((long long)(intptr_t)t), false},
+                                      {"type", std::to_string(type), false}, S("type_hex", hx) });
+    }
+    int rc = r_Bambu_StartStreamEx(t, type);
+    emit("Bambu_StartStreamEx_ret", { I("rc", rc) });
+    return rc;
+}
+int w_Bambu_GetStreamCount(bbl_cam::Bambu_Tunnel t) {
+    int rc = r_Bambu_GetStreamCount(t);
+    emit("Bambu_GetStreamCount", { I("count", rc) });
+    return rc;
+}
+int w_Bambu_GetStreamInfo(bbl_cam::Bambu_Tunnel t, int index, bbl_cam::Bambu_StreamInfo* info) {
+    int rc = r_Bambu_GetStreamInfo(t, index, info);
+    if (rc == bbl_cam::Bambu_success && info) {
+        emit("Bambu_GetStreamInfo", { I("index", index), I("type", info->type),
+              I("sub_type", info->sub_type), I("format_type", info->format_type),
+              I("width", info->format.video.width), I("height", info->format.video.height),
+              I("frame_rate", info->format.video.frame_rate),
+              I("format_size", info->format_size), I("max_frame_size", info->max_frame_size) });
+    } else {
+        emit("Bambu_GetStreamInfo", { I("index", index), I("rc", rc) });
+    }
+    return rc;
+}
+int w_Bambu_SendMessage(bbl_cam::Bambu_Tunnel t, int ctrl, char const* data, int len) {
+    // Handshake / CTRL JSON pushed to the source. Log ctrl + (scrubbed) body.
+    std::string body = (data && len > 0) ? std::string(data, (size_t)len) : std::string();
+    emit("Bambu_SendMessage", { {"ctrl", std::to_string(ctrl), false}, I("len", len),
+                                Sr("data", body) });
+    return r_Bambu_SendMessage(t, ctrl, data, len);
+}
+int w_Bambu_ReadSample(bbl_cam::Bambu_Tunnel t, bbl_cam::Bambu_Sample* sample) {
+    int rc = r_Bambu_ReadSample(t, sample);
+    // Only log real samples (skip the would_block polls that gst spins on).
+    if (rc == bbl_cam::Bambu_success && sample) {
+        unsigned long long seq = ++g_frame_seq;
+        FILE* f = logfp();
+        if (f) {
+            std::string pfx = frame_prefix_hex(sample->buffer, sample->size, 16);
+            std::string hsh = frame_hash_hex(sample->buffer, sample->size);
+            char line[512];
+            std::snprintf(line, sizeof line,
+                "{\"proto\":\"abi\",\"fn\":\"Bambu_ReadSample\",\"ts\":%lld,"
+                "\"args\":{\"seq\":%llu,\"itrack\":%d,\"size\":%d,\"flags\":%d,"
+                "\"sync\":%s,\"decode_time\":%llu,\"prefix\":\"%s\",\"fnv\":\"%s\"}}\n",
+                (long long)time(nullptr), seq, sample->itrack, sample->size, sample->flags,
+                (sample->flags & bbl_cam::f_sync) ? "true" : "false",
+                sample->decode_time, pfx.c_str(), hsh.c_str());
+            std::lock_guard<std::mutex> lk(g_mu);
+            fputs(line, f);
+        }
+    }
+    return rc;
+}
+void w_Bambu_Close(bbl_cam::Bambu_Tunnel t) {
+    emit("Bambu_Close", { {"tunnel", std::to_string((long long)(intptr_t)t), false},
+                          {"frames_total", std::to_string(g_frame_seq.load()), false} });
+    return r_Bambu_Close(t);
+}
+void w_Bambu_Destroy(bbl_cam::Bambu_Tunnel t) {
+    emit("Bambu_Destroy", { {"tunnel", std::to_string((long long)(intptr_t)t), false} });
+    return r_Bambu_Destroy(t);
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -326,6 +501,19 @@ extern "C" void* dlsym(void* handle, const char* name) {
 #define WRAP(sym, slot, wrap) \
     if (std::strcmp(name, sym) == 0) { slot = (decltype(slot))real; return (void*)&wrap; }
 
+    // The libBambuSource Bambu_* camera ABI lives in a separate module with no
+    // anti-hook self-check, so it is always safe to wrap. The bambu_network_*
+    // plugin symbols, by contrast, sit behind the plugin's init-time integrity
+    // check (some versions exit(0) if a call returns into an interposer frame):
+    // ABI_TAP_SKIP_NETWORK=1 leaves every plugin symbol untouched (returned
+    // real, byte-identical to no hook) so a video session can be captured on
+    // those versions purely from the BambuSource side.
+    static const bool skip_net = [] {
+        const char* e = getenv("ABI_TAP_SKIP_NETWORK");
+        return e && e[0] == '1';
+    }();
+    if (skip_net) goto camera_abi;
+
     WRAP("bambu_network_get_version", r_get_version, w_get_version)
     WRAP("bambu_network_create_agent", r_create_agent, w_create_agent)
     WRAP("bambu_network_set_config_dir", r_set_config_dir, w_set_config_dir)
@@ -340,6 +528,24 @@ extern "C" void* dlsym(void* handle, const char* name) {
     WRAP("bambu_network_set_on_message_fn", r_set_on_message_fn, w_set_on_message_fn)
     WRAP("bambu_network_set_on_local_message_fn", r_set_on_local_message_fn, w_set_on_local_message_fn)
     WRAP("bambu_network_set_on_user_message_fn", r_set_on_user_message_fn, w_set_on_user_message_fn)
+
+    // camera URL (network plugin)
+    WRAP("bambu_network_get_camera_url", r_get_camera_url, w_get_camera_url)
+    WRAP("bambu_network_get_camera_url_for_golive", r_get_camera_url_for_golive, w_get_camera_url_for_golive)
+
+camera_abi:
+    // libBambuSource camera transport ABI (dlsym'd from the BambuSource module)
+    WRAP("Bambu_Create", r_Bambu_Create, w_Bambu_Create)
+    WRAP("Bambu_SetLogger", r_Bambu_SetLogger, w_Bambu_SetLogger)
+    WRAP("Bambu_Open", r_Bambu_Open, w_Bambu_Open)
+    WRAP("Bambu_StartStream", r_Bambu_StartStream, w_Bambu_StartStream)
+    WRAP("Bambu_StartStreamEx", r_Bambu_StartStreamEx, w_Bambu_StartStreamEx)
+    WRAP("Bambu_GetStreamCount", r_Bambu_GetStreamCount, w_Bambu_GetStreamCount)
+    WRAP("Bambu_GetStreamInfo", r_Bambu_GetStreamInfo, w_Bambu_GetStreamInfo)
+    WRAP("Bambu_ReadSample", r_Bambu_ReadSample, w_Bambu_ReadSample)
+    WRAP("Bambu_SendMessage", r_Bambu_SendMessage, w_Bambu_SendMessage)
+    WRAP("Bambu_Close", r_Bambu_Close, w_Bambu_Close)
+    WRAP("Bambu_Destroy", r_Bambu_Destroy, w_Bambu_Destroy)
 #undef WRAP
 
     return real;   // untapped symbols pass straight through
