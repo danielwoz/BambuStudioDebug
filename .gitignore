@@ -58,6 +58,7 @@ tools/mitm-logging/alert_trace.so
 # all locally-built LD_PRELOAD diagnostics are build artifacts, never committed
 tools/mitm-logging/*.so
 tools/mitm-logging/abi_tap/*.so
+tools/mitm-logging/socklog/*.so
 tools/mitm-logging/pin_patch.so
 tools/mitm-logging/bambusource_tap/*.so
 tools/mitm-logging/bambusource_tap/libBambuSource*.so
