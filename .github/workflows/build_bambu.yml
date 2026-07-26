@@ -133,6 +133,25 @@ jobs:
           cmake .. -G "Visual Studio 17 2022" -A X64 -DBBL_RELEASE_TO_PUBLIC=1 -DBBL_INTERNAL_TESTING=0 -DCMAKE_PREFIX_PATH="${{ github.workspace }}\deps\build\BambuStudio_dep\usr\local" -DCMAKE_INSTALL_PREFIX="../install-dir" -DCMAKE_BUILD_TYPE=Release -DWIN10SDK_PATH="C:/Program Files (x86)/Windows Kits/10/Include/10.0.22000.0"
           cmake --build . --target install --config Release -- -m
 
+      - name: Sign binaries Win
+        if: inputs.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          if ("${{ secrets.CODESIGN_PFX_BASE64 }}" -ne "") {
+            Write-Host "Decoding code-signing PFX certificate..."
+            $pfxBytes = [System.Convert]::FromBase64String("${{ secrets.CODESIGN_PFX_BASE64 }}")
+            [System.IO.File]::WriteAllBytes("${{ github.workspace }}/codesign.pfx", $pfxBytes)
+            
+            $filesToSign = Get-ChildItem -Path "${{ github.workspace }}/install-dir" -Include "*.exe","*.dll" -Recurse
+            foreach ($file in $filesToSign) {
+              Write-Host "Signing $($file.FullName)..."
+              signtool sign /f "${{ github.workspace }}/codesign.pfx" /p "${{ secrets.CODESIGN_PFX_PASSWORD }}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $file.FullName
+            }
+            Remove-Item "${{ github.workspace }}/codesign.pfx" -Force
+          } else {
+            Write-Host "CODESIGN_PFX_BASE64 secret not set, skipping signing."
+          }
+
       # - name: Create installer Win
       #   if: inputs.os == 'windows-latest'
       #   working-directory: ${{ github.workspace }}/build
