@@ -50,6 +50,7 @@
 
 #include <fstream>
 #include <string_view>
+#include <thread>
 
 #include "GUI_App.hpp"
 #include "slic3r/GUI/PerfTrace.hpp"
@@ -1557,12 +1558,21 @@ void MainFrame::init_tabpanel()
         }
     }
 
-    // Auto-activate the Device (monitor) tab once the main frame is shown. The
-    // Debug/intercept build uses the Device tab to trigger the network plugin's
-    // cloud session + get_app_cert path automatically (no manual click needed).
-    // Queue the selection so it runs on the UI thread after the frame is shown.
-    if (wxGetApp().is_editor())
-        request_select_tab(tpMonitor);
+    if (wxGetApp().is_editor()) {
+        // The closed-source plugin establishes context lazily when the Device tab
+        // is opened. Clicking it too early (before the frame + plugin UI thread
+        // are up) makes it segfault. So drive a timed sequence on a detached
+        // thread: let it settle, surface Home, let it settle again, then click
+        // Device. request_select_tab queues onto the UI thread via wxQueueEvent.
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            wxGetApp().CallAfter([] { if (wxGetApp().mainframe)
+                wxGetApp().mainframe->select_tab(MainFrame::tpHome); });
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            wxGetApp().CallAfter([] { if (wxGetApp().mainframe)
+                wxGetApp().mainframe->request_select_tab(MainFrame::tpMonitor); });
+        }).detach();
+    }
 }
 
 
