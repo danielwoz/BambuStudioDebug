@@ -1556,6 +1556,13 @@ void MainFrame::init_tabpanel()
             m_plater->on_filament_count_change(full_config.option<ConfigOptionStrings>("filament_colour")->values.size());
         }
     }
+
+    // Auto-activate the Device (monitor) tab once the main frame is shown. The
+    // Debug/intercept build uses the Device tab to trigger the network plugin's
+    // cloud session + get_app_cert path automatically (no manual click needed).
+    // Queue the selection so it runs on the UI thread after the frame is shown.
+    if (wxGetApp().is_editor())
+        request_select_tab(tpMonitor);
 }
 
 
