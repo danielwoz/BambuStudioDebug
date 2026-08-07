@@ -1564,13 +1564,29 @@ void MainFrame::init_tabpanel()
         // are up) makes it segfault. So drive a timed sequence on a detached
         // thread: let it settle, surface Home, let it settle again, then click
         // Device. request_select_tab queues onto the UI thread via wxQueueEvent.
+        // After landing on the Device tab, give the plugin a beat then select the
+        // last-used machine (an H2S), which is what actually brings the genuine
+        // plugin's device context + get_app_cert path up without a manual click.
         std::thread([this]() {
             std::this_thread::sleep_for(std::chrono::seconds(30));
             wxGetApp().CallAfter([] { if (wxGetApp().mainframe)
                 wxGetApp().mainframe->select_tab(MainFrame::tpHome); });
             std::this_thread::sleep_for(std::chrono::seconds(30));
             wxGetApp().CallAfter([] { if (wxGetApp().mainframe)
-                wxGetApp().mainframe->request_select_tab(MainFrame::tpMonitor); });
+                wxGetApp().mainframe->select_tab(MainFrame::tpMonitor); });
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            wxGetApp().CallAfter([] {
+                auto mf = wxGetApp().mainframe;
+                auto dev = wxGetApp().getDeviceManager();
+                if (mf && mf->m_monitor && dev) {
+                    std::string sn;
+                    if (Slic3r::MachineObject *obj = dev->get_selected_machine())
+                        sn = obj->get_dev_id();
+                    if (sn.empty()) sn = "0938BC582502312";
+                    if (!sn.empty())
+                        mf->m_monitor->select_machine(sn);
+                }
+            });
         }).detach();
     }
 }

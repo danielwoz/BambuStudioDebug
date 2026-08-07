@@ -42,3 +42,11 @@ compile_commands.json
 resources/web/device_page/assets/
 resources/web/device_page/index.html
 
+
+# BambuStudioDebug cloud_tap in-process plaintext capture: runtime logs + build
+# artifacts contain live tokens/personal data -- never commit.
+/mitm-captures/
+tools/mitm-logging/cloud_tap/cloud_tap.so
+tools/mitm-logging/mitm_redirect.so
+tools/mitm-logging/__pycache__/
+tools/mitm-logging/*.so
