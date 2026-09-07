@@ -145,11 +145,11 @@ jobs:
         shell: cmd
         run: '"C:/Program Files/7-Zip/7z.exe" a -tzip BambuStudio_Windows_${{ env.ver }}_portable.zip ${{ github.workspace }}/install-dir'
 
-      # - name: Pack PDB
-      #   if: inputs.os == 'windows-latest'
-      #   working-directory: ${{ github.workspace }}/build/src/Release
-      #   shell: cmd
-      #   run: '"C:/Program Files/7-Zip/7z.exe" a -m0=lzma2 -mx9 Debug_PDB_${{ env.ver }}_for_developers_only.7z  *.pdb'
+      - name: Pack PDB
+        if: inputs.os == 'windows-latest'
+        working-directory: ${{ github.workspace }}/build/src/Release
+        shell: cmd
+        run: '"C:/Program Files/7-Zip/7z.exe" a -m0=lzma2 -mx9 ${{ github.workspace }}/BambuStudio_Windows_${{ env.ver }}_PDB.7z *.pdb'
 
       - name: Upload artifacts Win zip
         if: inputs.os == 'windows-latest'
@@ -157,6 +157,13 @@ jobs:
         with:
           name: BambuStudio_Windows_${{ env.ver }}_portable
           path: ${{ github.workspace }}/BambuStudio_Windows_${{ env.ver }}_portable.zip
+
+      - name: Upload artifacts Win PDB
+        if: inputs.os == 'windows-latest'
+        uses: actions/upload-artifact@v6
+        with:
+          name: BambuStudio_Windows_${{ env.ver }}_PDB
+          path: ${{ github.workspace }}/BambuStudio_Windows_${{ env.ver }}_PDB.7z
 
 
   # Ubuntu
