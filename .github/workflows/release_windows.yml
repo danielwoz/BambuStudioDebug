@@ -1,0 +1,52 @@
+name: Release Windows
+
+# Builds the Windows BambuStudio debug binary (portable zip + PDBs) and publishes
+# it as a GitHub pre-release. Triggered by pushing a debug-<version> tag, or run
+# manually with a tag input.
+
+on:
+  push:
+    branches:
+      - 'debug-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. debug-02.08.02.60)'
+        required: true
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+    secrets: inherit
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: BambuStudio_Windows_*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: BambuStudioDebug — Windows (${{ inputs.tag || github.ref_name }})
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/**/*.zip
+            dist/**/*.7z
